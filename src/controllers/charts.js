@@ -1,6 +1,6 @@
 class Controllers {
   constructor() {
-    this.service = require("../services/charts");
+    this.service = require("../services/charts-service");
   }
 
   async getTotalQueries(req, res) {

@@ -1,6 +1,6 @@
 class Controllers {
   constructor() {
-    this.service = require("../services/qdrant");
+    this.service = require("../services/qdrant-service");
   }
 
   async getCollections(req, res) {

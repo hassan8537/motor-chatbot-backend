@@ -1,12 +1,20 @@
-function chunkText(text, maxWords = 200) {
-  const words = text.split(/\s+/);
-  const chunks = [];
+const { RecursiveCharacterTextSplitter } = require("langchain/text_splitter");
 
-  for (let i = 0; i < words.length; i += maxWords) {
-    chunks.push(words.slice(i, i + maxWords).join(" "));
-  }
+/**
+ * Splits input text into semantically coherent chunks using LangChain.
+ * @param {string} text - The full text to split
+ * @param {number} chunkSize - Max size of each chunk in characters
+ * @param {number} chunkOverlap - Number of overlapping characters
+ * @returns {Promise<string[]>}
+ */
+async function chunkText(text, chunkSize = 1000, chunkOverlap = 200) {
+  const splitter = new RecursiveCharacterTextSplitter({
+    chunkSize,
+    chunkOverlap,
+  });
 
-  return chunks;
+  const docs = await splitter.createDocuments([text]);
+  return docs.map((doc) => doc.pageContent);
 }
 
 module.exports = chunkText;

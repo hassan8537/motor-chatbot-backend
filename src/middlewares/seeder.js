@@ -18,13 +18,13 @@ async function seedAdmin(req, res, next) {
       KeyConditionExpression: "#Email = :email",
       ExpressionAttributeNames: { "#Email": "Email" },
       ExpressionAttributeValues: { ":email": normalizedEmail },
-      Limit: 1
+      Limit: 1,
     });
 
     const result = await docClient.send(checkCommand);
 
     if (result.Items && result.Items.length > 0) {
-      console.log("ℹ️ Admin user already exists. Skipping seeding.");
+      console.log("Admin user already exists. Skipping seeding.");
       return next();
     }
 
@@ -40,12 +40,13 @@ async function seedAdmin(req, res, next) {
       Email: normalizedEmail,
       Password: hashedPassword,
       Role: "admin",
-      CreatedAt: new Date().toISOString()
+      IsActive: true,
+      CreatedAt: new Date().toISOString(),
     };
 
     const putCommand = new PutCommand({
       TableName: TABLE_NAME,
-      Item: adminUser
+      Item: adminUser,
     });
 
     await docClient.send(putCommand);
