@@ -5,25 +5,26 @@ const getEmbedding = require("../utilities/get-embedding");
 const { v4: uuidv4 } = require("uuid");
 const { upsertEmbeddings } = require("../utilities/qdrant-functions");
 const { s3Client } = require("../config/aws");
-const { GetObjectCommand } = require("@aws-sdk/client-s3");
+const { GetObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
 const path = require("path");
 const { saveFileDetails } = require("../utilities/save-query");
 const { Readable } = require("stream");
 
 // 🚀 Optimized Constants
-const MAX_CONCURRENT_EMBEDDINGS = 8; // Increased for better throughput
-const MAX_CONCURRENT_UPLOADS = 10; // Separate limit for Qdrant uploads
+const MAX_CONCURRENT_EMBEDDINGS = 8;
+const MAX_CONCURRENT_UPLOADS = 10;
 const MAX_RETRY_ATTEMPTS = 3;
-const RETRY_DELAY_MS = 500; // Reduced initial delay
+const RETRY_DELAY_MS = 500;
 const SUPPORTED_FILE_TYPES = [".pdf"];
 const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
-const STREAM_TIMEOUT_MS = 45000; // 45 seconds
-const BATCH_PROCESSING_DELAY = 50; // Reduced delay between batches
+const STREAM_TIMEOUT_MS = 45000;
+const BATCH_PROCESSING_DELAY = 50;
+const MIN_TEXT_LENGTH = 50; // Minimum viable text length
 
 // 📊 Rate limiting for embedding API
 const EMBEDDING_RATE_LIMIT = {
   maxRequests: 100,
-  windowMs: 60000, // 1 minute
+  windowMs: 60000,
   requests: [],
 };
 
@@ -32,18 +33,27 @@ class OptimizedDocumentAIService {
     this.bucket = process.env.BUCKET_NAME;
     this.tableName = process.env.DYNAMODB_TABLE_NAME;
 
-    // 📊 Performance tracking
+    // 📊 Performance tracking with enhanced metrics
     this.metrics = {
       totalProcessed: 0,
       totalErrors: 0,
+      totalDeleted: 0, // Track deleted files
       averageProcessingTime: 0,
       totalChunksProcessed: 0,
       totalTextExtracted: 0,
+      errorTypes: {
+        textExtraction: 0,
+        chunking: 0,
+        embedding: 0,
+        upload: 0,
+        s3Access: 0,
+        validation: 0,
+      },
     };
 
     // 🧠 Simple caching for repeated operations
-    this.textCache = new Map(); // Cache extracted text by S3 key
-    this.chunkCache = new Map(); // Cache chunked text
+    this.textCache = new Map();
+    this.chunkCache = new Map();
     this.CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
     // Validate required environment variables
@@ -53,7 +63,32 @@ class OptimizedDocumentAIService {
       );
     }
 
-    console.log("🚀 Optimized Document AI Service initialized");
+    console.log(
+      "🚀 Enhanced Document AI Service initialized with auto-cleanup"
+    );
+  }
+
+  /**
+   * 🗑️ Delete file from S3 with retry logic
+   */
+  async deleteFileFromS3(key, reason = "processing_failed") {
+    try {
+      console.log(`🗑️ Deleting file from S3 due to: ${reason} - ${key}`);
+
+      const deleteCommand = new DeleteObjectCommand({
+        Bucket: this.bucket,
+        Key: key,
+      });
+
+      await s3Client.send(deleteCommand);
+      this.metrics.totalDeleted++;
+      console.log(`✅ File deleted from S3: ${key}`);
+
+      return true;
+    } catch (error) {
+      console.error(`❌ Failed to delete file from S3: ${key}`, error.message);
+      return false;
+    }
   }
 
   /**
@@ -62,7 +97,6 @@ class OptimizedDocumentAIService {
   async checkEmbeddingRateLimit() {
     const now = Date.now();
 
-    // Clean old requests
     EMBEDDING_RATE_LIMIT.requests = EMBEDDING_RATE_LIMIT.requests.filter(
       timestamp => now - timestamp < EMBEDDING_RATE_LIMIT.windowMs
     );
@@ -101,7 +135,6 @@ class OptimizedDocumentAIService {
       timestamp: Date.now(),
     });
 
-    // Cleanup if cache gets too large
     if (this.textCache.size > 50) {
       const oldestKey = this.textCache.keys().next().value;
       this.textCache.delete(oldestKey);
@@ -124,7 +157,6 @@ class OptimizedDocumentAIService {
       timestamp: Date.now(),
     });
 
-    // Cleanup if cache gets too large
     if (this.chunkCache.size > 20) {
       const oldestKey = this.chunkCache.keys().next().value;
       this.chunkCache.delete(oldestKey);
@@ -143,11 +175,9 @@ class OptimizedDocumentAIService {
         chunks.push(chunk);
         receivedSize += chunk.length;
 
-        // Progress logging for large files
         if (expectedSize && receivedSize > 0) {
           const progress = Math.round((receivedSize / expectedSize) * 100);
           if (progress % 25 === 0) {
-            // Log every 25%
             console.log(`📥 Download progress: ${progress}%`);
           }
         }
@@ -167,7 +197,6 @@ class OptimizedDocumentAIService {
         reject(new Error(`Stream error: ${error.message}`));
       });
 
-      // Enhanced timeout with better error message
       const timeout = setTimeout(() => {
         reject(
           new Error(`Stream timeout after ${STREAM_TIMEOUT_MS / 1000} seconds`)
@@ -203,7 +232,6 @@ class OptimizedDocumentAIService {
           throw new Error("No data received from S3");
         }
 
-        // Enhanced file size validation
         const contentLength = data.ContentLength;
         if (contentLength && contentLength > MAX_FILE_SIZE) {
           throw new Error(
@@ -229,16 +257,19 @@ class OptimizedDocumentAIService {
           error.message
         );
 
-        // Don't retry on certain errors
+        // Track S3 access errors
+        this.metrics.errorTypes.s3Access++;
+
         if (
           error.message.includes("too large") ||
-          error.message.includes("not found")
+          error.message.includes("not found") ||
+          error.message.includes("NoSuchKey")
         ) {
           throw error;
         }
 
         if (attempt < MAX_RETRY_ATTEMPTS) {
-          const delay = RETRY_DELAY_MS * Math.pow(2, attempt - 1); // Exponential backoff
+          const delay = RETRY_DELAY_MS * Math.pow(2, attempt - 1);
           await this.delay(delay);
         }
       }
@@ -250,7 +281,7 @@ class OptimizedDocumentAIService {
   }
 
   /**
-   * 🧠 Enhanced text extraction with caching
+   * 🧠 Enhanced text extraction with better error handling
    */
   async extractTextFromPdf(pdfBuffer, key) {
     // Check cache first
@@ -263,35 +294,68 @@ class OptimizedDocumentAIService {
     const startTime = Date.now();
 
     try {
-      const { text } = await extractFromPDF(pdfBuffer);
+      const result = await extractFromPDF(pdfBuffer);
 
-      if (!text || text.trim().length === 0) {
-        throw new Error("No text content extracted from PDF");
+      if (
+        !result ||
+        !result.text ||
+        result.text.trim().length < MIN_TEXT_LENGTH
+      ) {
+        throw new Error(
+          `Insufficient text extracted: only ${
+            result?.text?.length || 0
+          } characters found`
+        );
       }
 
       const extractionTime = Date.now() - startTime;
       console.log(
-        `✅ Text extracted: ${text.length} characters in ${extractionTime}ms`
+        `✅ Text extracted: ${result.text.length} characters in ${extractionTime}ms (method: ${result.method})`
       );
 
       // Cache the result
-      this.setCachedText(key, text);
+      this.setCachedText(key, result.text);
 
-      return text;
+      return result.text;
     } catch (error) {
       console.error("❌ Text extraction failed:", error.message);
+      this.metrics.errorTypes.textExtraction++;
+
+      // Enhanced error classification
+      if (
+        error.message.includes("no extractable text") ||
+        error.message.includes("image-based")
+      ) {
+        throw new Error(
+          "PDF_IMAGE_BASED: This PDF appears to be image-based. Please convert it to a text-based PDF and try again."
+        );
+      }
+
+      if (
+        error.message.includes("corrupted") ||
+        error.message.includes("invalid")
+      ) {
+        throw new Error(
+          "PDF_CORRUPTED: PDF file appears to be corrupted. Please try uploading a different file."
+        );
+      }
+
+      if (error.message.includes("password")) {
+        throw new Error(
+          "PDF_PROTECTED: PDF is password protected. Please remove the password and try again."
+        );
+      }
+
       throw new Error(`Text extraction failed: ${error.message}`);
     }
   }
 
   /**
-   * ✂️ Enhanced text chunking with caching
+   * ✂️ Enhanced text chunking with caching and validation
    */
   async chunkTextWithCache(text) {
-    // Create a simple hash for caching
-    const textHash = this.simpleHash(text.substring(0, 1000)); // Hash first 1000 chars
+    const textHash = this.simpleHash(text.substring(0, 1000));
 
-    // Check cache first
     const cachedChunks = this.getCachedChunks(textHash);
     if (cachedChunks) {
       return cachedChunks;
@@ -304,24 +368,36 @@ class OptimizedDocumentAIService {
       const chunks = await chunkText(text);
 
       if (!chunks || chunks.length === 0) {
-        throw new Error("No text chunks generated");
+        throw new Error(
+          "No text chunks generated - text may be too short or invalid"
+        );
+      }
+
+      // Validate chunk quality
+      const validChunks = chunks.filter(
+        chunk => chunk && typeof chunk === "string" && chunk.trim().length > 10
+      );
+
+      if (validChunks.length === 0) {
+        throw new Error("All generated chunks are invalid or too short");
       }
 
       const chunkingTime = Date.now() - startTime;
-      console.log(`✅ Generated ${chunks.length} chunks in ${chunkingTime}ms`);
+      console.log(
+        `✅ Generated ${validChunks.length} valid chunks in ${chunkingTime}ms`
+      );
 
-      // Cache the result
-      this.setCachedChunks(textHash, chunks);
-
-      return chunks;
+      this.setCachedChunks(textHash, validChunks);
+      return validChunks;
     } catch (error) {
       console.error("❌ Text chunking failed:", error.message);
+      this.metrics.errorTypes.chunking++;
       throw new Error(`Text chunking failed: ${error.message}`);
     }
   }
 
   /**
-   * 🚀 Optimized batch embedding processing with enhanced concurrency
+   * 🚀 Optimized batch embedding processing with enhanced error handling
    */
   async processEmbeddingsInBatches(
     chunks,
@@ -338,7 +414,6 @@ class OptimizedDocumentAIService {
     const errors = [];
     const startTime = Date.now();
 
-    // Process chunks in optimized batches
     for (let i = 0; i < chunks.length; i += MAX_CONCURRENT_EMBEDDINGS) {
       const batch = chunks.slice(i, i + MAX_CONCURRENT_EMBEDDINGS);
       const batchNumber = Math.floor(i / MAX_CONCURRENT_EMBEDDINGS) + 1;
@@ -349,27 +424,21 @@ class OptimizedDocumentAIService {
       );
 
       try {
-        // Process embeddings with rate limiting
         const embeddingPromises = batch.map(async (chunk, index) => {
           const globalIndex = i + index;
 
           try {
-            // Apply rate limiting
             await this.checkEmbeddingRateLimit();
 
-            // Generate embedding with retry
             const embedding = await this.retryOperation(
               () => getEmbedding(chunk),
               2,
               `Generate embedding for chunk ${globalIndex}`
             );
 
-            return {
-              chunk,
-              embedding,
-              globalIndex,
-            };
+            return { chunk, embedding, globalIndex };
           } catch (error) {
+            this.metrics.errorTypes.embedding++;
             throw new Error(
               `Chunk ${globalIndex} embedding failed: ${error.message}`
             );
@@ -377,8 +446,6 @@ class OptimizedDocumentAIService {
         });
 
         const embeddingResults = await Promise.allSettled(embeddingPromises);
-
-        // Process successful embeddings and upload to Qdrant in parallel
         const uploadPromises = [];
 
         embeddingResults.forEach((result, index) => {
@@ -387,7 +454,6 @@ class OptimizedDocumentAIService {
           if (result.status === "fulfilled") {
             const { chunk, embedding } = result.value;
 
-            // Create upload promise
             const uploadPromise = this.retryOperation(
               async () => {
                 const id = uuidv4();
@@ -403,7 +469,7 @@ class OptimizedDocumentAIService {
                     sectionType: "full_text",
                     chunkIndex: globalIndex,
                     totalChunks: chunks.length,
-                    userId, // Add userId to payload
+                    userId,
                     createdAt: new Date().toISOString(),
                   },
                   dimension: 1536,
@@ -449,6 +515,7 @@ class OptimizedDocumentAIService {
             if (result.status === "fulfilled") {
               results.push(result.value);
             } else {
+              this.metrics.errorTypes.upload++;
               errors.push({
                 chunkIndex: i + index,
                 error: result.reason.message,
@@ -466,7 +533,6 @@ class OptimizedDocumentAIService {
         });
       }
 
-      // Progress update
       const progressPercent = Math.round(
         (results.length / chunks.length) * 100
       );
@@ -474,7 +540,6 @@ class OptimizedDocumentAIService {
         `📊 Progress: ${results.length}/${chunks.length} chunks processed (${progressPercent}%)`
       );
 
-      // Optimized delay between batches
       if (i + MAX_CONCURRENT_EMBEDDINGS < chunks.length) {
         await this.delay(BATCH_PROCESSING_DELAY);
       }
@@ -486,7 +551,7 @@ class OptimizedDocumentAIService {
     );
 
     if (errors.length > 0) {
-      console.warn("⚠️ Some chunks failed to process:", errors.slice(0, 5)); // Log first 5 errors
+      console.warn("⚠️ Some chunks failed to process:", errors.slice(0, 5));
     }
 
     return {
@@ -514,7 +579,6 @@ class OptimizedDocumentAIService {
           console.warn(`⚠️ ${operationName} failed, retrying...`);
         }
 
-        // Don't retry on certain errors
         if (
           error.message?.includes("validation") ||
           error.message?.includes("authorization") ||
@@ -543,7 +607,7 @@ class OptimizedDocumentAIService {
     for (let i = 0; i < str.length; i++) {
       const char = str.charCodeAt(i);
       hash = (hash << 5) - hash + char;
-      hash = hash & hash; // Convert to 32-bit integer
+      hash = hash & hash;
     }
     return hash.toString();
   }
@@ -557,7 +621,6 @@ class OptimizedDocumentAIService {
     if (!key?.trim()) {
       errors.push("Missing or invalid 'key' parameter");
     } else {
-      // Enhanced file validation
       const fileExtension = path.extname(key).toLowerCase();
       if (!SUPPORTED_FILE_TYPES.includes(fileExtension)) {
         errors.push(
@@ -567,7 +630,6 @@ class OptimizedDocumentAIService {
         );
       }
 
-      // Check for suspicious file names
       if (key.includes("..") || key.includes("//")) {
         errors.push("Invalid file path detected");
       }
@@ -583,10 +645,11 @@ class OptimizedDocumentAIService {
       errors.push("Missing or invalid user ID");
     }
 
-    return {
-      isValid: errors.length === 0,
-      errors,
-    };
+    if (errors.length > 0) {
+      this.metrics.errorTypes.validation++;
+    }
+
+    return { isValid: errors.length === 0, errors };
   }
 
   /**
@@ -598,7 +661,6 @@ class OptimizedDocumentAIService {
       this.metrics.totalChunksProcessed += chunksProcessed;
       this.metrics.totalTextExtracted += textLength;
 
-      // Moving average for processing time
       const alpha = 0.1;
       this.metrics.averageProcessingTime =
         this.metrics.averageProcessingTime * (1 - alpha) +
@@ -616,10 +678,12 @@ class OptimizedDocumentAIService {
   }
 
   /**
-   * 🎯 Main optimized PDF processing method
+   * 🎯 Main optimized PDF processing method with auto-cleanup
    */
   async processUploadedPdf(req, res) {
     const startTime = Date.now();
+    let shouldDeleteFile = false;
+    let deleteReason = "";
 
     try {
       console.log("🚀 === Starting optimized PDF processing ===");
@@ -630,6 +694,9 @@ class OptimizedDocumentAIService {
       // Enhanced validation
       const validation = this.validateInput({ key, collectionName, userId });
       if (!validation.isValid) {
+        shouldDeleteFile = true;
+        deleteReason = "validation_failed";
+
         return handlers.response.failed({
           res,
           message: `Validation failed: ${validation.errors.join(", ")}`,
@@ -641,13 +708,39 @@ class OptimizedDocumentAIService {
       console.log(`📄 Processing file: ${fileName} for user: ${userId}`);
 
       // Step 1: Download PDF from S3
-      const pdfBuffer = await this.downloadPdfFromS3(key);
+      let pdfBuffer;
+      try {
+        pdfBuffer = await this.downloadPdfFromS3(key);
+      } catch (error) {
+        if (
+          error.message.includes("too large") ||
+          error.message.includes("not found")
+        ) {
+          shouldDeleteFile = true;
+          deleteReason = "s3_download_failed";
+        }
+        throw error;
+      }
 
-      // Step 2: Extract text with caching
-      const text = await this.extractTextFromPdf(pdfBuffer, key);
+      // Step 2: Extract text with enhanced error handling
+      let text;
+      try {
+        text = await this.extractTextFromPdf(pdfBuffer, key);
+      } catch (error) {
+        shouldDeleteFile = true;
+        deleteReason = "text_extraction_failed";
+        throw error;
+      }
 
       // Step 3: Chunk text with caching
-      const chunks = await this.chunkTextWithCache(text);
+      let chunks;
+      try {
+        chunks = await this.chunkTextWithCache(text);
+      } catch (error) {
+        shouldDeleteFile = true;
+        deleteReason = "text_chunking_failed";
+        throw error;
+      }
 
       // Step 4: Process embeddings with optimized batching
       console.log(
@@ -661,30 +754,49 @@ class OptimizedDocumentAIService {
         userId
       );
 
+      // Check if embedding processing was successful enough
+      const successRate = embeddingResults.successCount / chunks.length;
+      if (successRate < 0.5) {
+        // Less than 50% success rate
+        shouldDeleteFile = true;
+        deleteReason = "embedding_processing_failed";
+        throw new Error(
+          `Embedding processing failed: only ${Math.round(
+            successRate * 100
+          )}% of chunks processed successfully`
+        );
+      }
+
       // Step 5: Save file metadata
       console.log("💾 Step 5: Saving file metadata...");
-      await this.retryOperation(
-        () =>
-          saveFileDetails({
-            userId,
-            fileName,
-            key,
-            collectionName,
-            timestamp: new Date().toISOString(),
-            tableName: this.tableName,
-            bucketName: this.bucket,
-            totalChunks: chunks.length,
-            successfulChunks: embeddingResults.successCount,
-            textLength: text.length,
-            processingTimeMs: embeddingResults.processingTimeMs,
-          }),
-        2,
-        "Save file metadata"
-      );
+      try {
+        await this.retryOperation(
+          () =>
+            saveFileDetails({
+              userId,
+              fileName,
+              key,
+              collectionName,
+              timestamp: new Date().toISOString(),
+              tableName: this.tableName,
+              bucketName: this.bucket,
+              totalChunks: chunks.length,
+              successfulChunks: embeddingResults.successCount,
+              textLength: text.length,
+              processingTimeMs: embeddingResults.processingTimeMs,
+            }),
+          2,
+          "Save file metadata"
+        );
+      } catch (error) {
+        shouldDeleteFile = true;
+        deleteReason = "metadata_save_failed";
+        throw error;
+      }
 
       const totalProcessingTime = Date.now() - startTime;
 
-      // Update metrics
+      // Update success metrics
       this.updateMetrics(
         totalProcessingTime,
         embeddingResults.successCount,
@@ -708,6 +820,9 @@ class OptimizedDocumentAIService {
           embeddingProcessingTimeMs: embeddingResults.processingTimeMs,
           textLength: text.length,
           collectionName,
+          successRate: Math.round(
+            (embeddingResults.successCount / chunks.length) * 100
+          ),
           performance: {
             avgChunkProcessingTime:
               embeddingResults.processingTimeMs / chunks.length,
@@ -720,7 +835,7 @@ class OptimizedDocumentAIService {
           errors:
             embeddingResults.errors.length > 0
               ? embeddingResults.errors.slice(0, 10)
-              : undefined, // Limit errors in response
+              : undefined,
         },
       });
     } catch (error) {
@@ -734,13 +849,42 @@ class OptimizedDocumentAIService {
         error
       );
 
+      // Delete file from S3 if processing failed
+      if (shouldDeleteFile && req.body?.key) {
+        console.log(`🗑️ Deleting failed file from S3: ${deleteReason}`);
+        await this.deleteFileFromS3(req.body.key, deleteReason);
+      }
+
+      // Enhanced error response with user-friendly messages
+      let userMessage = error.message;
+      let suggestions = [];
+
+      if (error.message.includes("PDF_IMAGE_BASED")) {
+        userMessage =
+          "This PDF appears to be image-based and cannot be processed.";
+        suggestions.push("Convert the PDF to a text-based format");
+        suggestions.push("Ensure the PDF contains selectable text");
+      } else if (error.message.includes("PDF_CORRUPTED")) {
+        userMessage = "The PDF file appears to be corrupted or invalid.";
+        suggestions.push("Try re-saving or re-creating the PDF");
+        suggestions.push("Upload a different PDF file");
+      } else if (error.message.includes("PDF_PROTECTED")) {
+        userMessage = "The PDF is password protected.";
+        suggestions.push("Remove the password protection");
+        suggestions.push("Upload an unprotected version");
+      }
+
       return handlers.response.error({
         res,
-        message: `PDF processing failed: ${error.message}`,
+        message: `PDF processing failed: ${userMessage}`,
         statusCode: error.statusCode || 500,
         data: {
           processingTimeMs: totalProcessingTime,
-          stage: error.stage || "unknown",
+          stage: error.stage || deleteReason || "unknown",
+          fileDeleted: shouldDeleteFile,
+          deleteReason,
+          suggestions,
+          errorType: this.classifyError(error),
           error:
             process.env.NODE_ENV === "development" ? error.stack : undefined,
         },
@@ -749,7 +893,41 @@ class OptimizedDocumentAIService {
   }
 
   /**
-   * 📊 Get service metrics
+   * 🏷️ Classify error types for better tracking
+   */
+  classifyError(error) {
+    const message = error.message.toLowerCase();
+
+    if (
+      message.includes("image-based") ||
+      message.includes("no extractable text")
+    ) {
+      return "image_based_pdf";
+    }
+    if (message.includes("corrupted") || message.includes("invalid")) {
+      return "corrupted_pdf";
+    }
+    if (message.includes("password") || message.includes("protected")) {
+      return "protected_pdf";
+    }
+    if (message.includes("too large") || message.includes("size")) {
+      return "file_too_large";
+    }
+    if (message.includes("embedding") || message.includes("vector")) {
+      return "embedding_error";
+    }
+    if (message.includes("s3") || message.includes("download")) {
+      return "s3_error";
+    }
+    if (message.includes("chunk")) {
+      return "chunking_error";
+    }
+
+    return "unknown_error";
+  }
+
+  /**
+   * 📊 Get enhanced service metrics
    */
   async getMetrics(req, res) {
     try {
@@ -761,11 +939,23 @@ class OptimizedDocumentAIService {
           cache: {
             textCacheSize: this.textCache.size,
             chunkCacheSize: this.chunkCache.size,
+            cacheHitRate: this.calculateCacheHitRate(),
           },
           system: {
             uptime: process.uptime(),
             memoryUsage: process.memoryUsage(),
+            nodeVersion: process.version,
           },
+          processing: {
+            successRate: this.calculateSuccessRate(),
+            averageProcessingTime: Math.round(
+              this.metrics.averageProcessingTime
+            ),
+            totalFilesProcessed: this.metrics.totalProcessed,
+            totalErrors: this.metrics.totalErrors,
+            totalFilesDeleted: this.metrics.totalDeleted,
+          },
+          errorBreakdown: this.metrics.errorTypes,
         },
       });
     } catch (error) {
@@ -778,24 +968,179 @@ class OptimizedDocumentAIService {
   }
 
   /**
-   * 🧹 Clear caches
+   * 📈 Calculate cache hit rate
+   */
+  calculateCacheHitRate() {
+    const totalCacheAttempts = this.metrics.totalProcessed;
+    if (totalCacheAttempts === 0) return 0;
+
+    // This is a simplified calculation - you might want to track actual cache hits
+    const estimatedHits = Math.min(
+      this.textCache.size + this.chunkCache.size,
+      totalCacheAttempts
+    );
+    return Math.round((estimatedHits / totalCacheAttempts) * 100);
+  }
+
+  /**
+   * 📊 Calculate success rate
+   */
+  calculateSuccessRate() {
+    const total = this.metrics.totalProcessed + this.metrics.totalErrors;
+    if (total === 0) return 100;
+
+    return Math.round((this.metrics.totalProcessed / total) * 100);
+  }
+
+  /**
+   * 🧹 Clear caches with enhanced logging
    */
   async clearCaches(req, res) {
     try {
+      const textCacheSize = this.textCache.size;
+      const chunkCacheSize = this.chunkCache.size;
+
       this.textCache.clear();
       this.chunkCache.clear();
 
-      console.log("🧹 Document AI caches cleared");
+      console.log(
+        `🧹 Document AI caches cleared: ${textCacheSize} text entries, ${chunkCacheSize} chunk entries`
+      );
 
       return handlers.response.success({
         res,
         message: "Caches cleared successfully",
-        data: { timestamp: new Date().toISOString() },
+        data: {
+          timestamp: new Date().toISOString(),
+          clearedEntries: {
+            textCache: textCacheSize,
+            chunkCache: chunkCacheSize,
+            total: textCacheSize + chunkCacheSize,
+          },
+        },
       });
     } catch (error) {
       return handlers.response.error({
         res,
         message: "Failed to clear caches",
+        statusCode: 500,
+      });
+    }
+  }
+
+  /**
+   * 🔍 Health check with comprehensive status
+   */
+  async healthCheck(req, res) {
+    try {
+      const health = {
+        status: "healthy",
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime(),
+        version: process.version,
+        environment: process.env.NODE_ENV || "development",
+        services: {
+          s3: "unknown",
+          dynamodb: "unknown",
+          qdrant: "unknown",
+        },
+        metrics: {
+          processedFiles: this.metrics.totalProcessed,
+          errors: this.metrics.totalErrors,
+          successRate: this.calculateSuccessRate(),
+          cacheSize: this.textCache.size + this.chunkCache.size,
+        },
+      };
+
+      // Quick S3 connectivity check
+      try {
+        await s3Client.send(
+          new GetObjectCommand({
+            Bucket: this.bucket,
+            Key: "health-check-dummy-key",
+          })
+        );
+        health.services.s3 = "healthy";
+      } catch (error) {
+        if (error.name === "NoSuchKey") {
+          health.services.s3 = "healthy"; // Bucket accessible, key doesn't exist (expected)
+        } else {
+          health.services.s3 = "error";
+          health.status = "degraded";
+        }
+      }
+
+      return handlers.response.success({
+        res,
+        message: "Health check completed",
+        data: health,
+      });
+    } catch (error) {
+      return handlers.response.error({
+        res,
+        message: "Health check failed",
+        statusCode: 503,
+        data: {
+          status: "unhealthy",
+          error: error.message,
+          timestamp: new Date().toISOString(),
+        },
+      });
+    }
+  }
+
+  /**
+   * 📋 Get processing statistics
+   */
+  async getProcessingStats(req, res) {
+    try {
+      const stats = {
+        overview: {
+          totalProcessed: this.metrics.totalProcessed,
+          totalErrors: this.metrics.totalErrors,
+          totalDeleted: this.metrics.totalDeleted,
+          successRate: this.calculateSuccessRate(),
+          averageProcessingTime: Math.round(this.metrics.averageProcessingTime),
+        },
+        performance: {
+          totalChunksProcessed: this.metrics.totalChunksProcessed,
+          totalTextExtracted: this.metrics.totalTextExtracted,
+          averageChunksPerFile:
+            this.metrics.totalProcessed > 0
+              ? Math.round(
+                  this.metrics.totalChunksProcessed /
+                    this.metrics.totalProcessed
+                )
+              : 0,
+          averageTextPerFile:
+            this.metrics.totalProcessed > 0
+              ? Math.round(
+                  this.metrics.totalTextExtracted / this.metrics.totalProcessed
+                )
+              : 0,
+        },
+        errorBreakdown: this.metrics.errorTypes,
+        cache: {
+          textCacheEntries: this.textCache.size,
+          chunkCacheEntries: this.chunkCache.size,
+          estimatedHitRate: this.calculateCacheHitRate(),
+        },
+        system: {
+          uptime: Math.round(process.uptime()),
+          memoryUsageMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
+          nodeVersion: process.version,
+        },
+      };
+
+      return handlers.response.success({
+        res,
+        message: "Processing statistics retrieved",
+        data: stats,
+      });
+    } catch (error) {
+      return handlers.response.error({
+        res,
+        message: "Failed to get processing statistics",
         statusCode: 500,
       });
     }

@@ -1,4 +1,4 @@
-const { s3Client } = require("../config/aws");
+const { s3Client, docClient } = require("../config/aws");
 const { handlers } = require("../utilities/handlers");
 const {
   PutObjectCommand,
@@ -11,25 +11,20 @@ const {
   deleteEmbeddingsByPayloadKey,
   createQdrantIndex,
 } = require("../utilities/qdrant-functions");
+const { QueryCommand, DeleteCommand } = require("@aws-sdk/lib-dynamodb");
 
 class S3Service {
   constructor() {
     this.bucket = process.env.BUCKET_NAME;
-    this.defaultPresignedUrlExpiration = 300; // 5 minutes
+    this.dynamoTableName = process.env.DYNAMODB_TABLE_NAME || "Chatbot";
+    this.defaultPresignedUrlExpiration = 300;
     this.defaultCollectionName = "document_embeddings";
     this.allowedFileTypes = new Set(["application/pdf"]);
-    this.maxFileSize = 10 * 1024 * 1024; // 10MB
-  }
-
-  // Validation helpers
-  _validateFileType(fileType) {
-    return this.allowedFileTypes.has(fileType.toLowerCase());
+    this.dynamoClient = docClient;
   }
 
   _validateKey(key) {
-    // Basic validation: no empty strings, no dangerous characters
     return (
-      key &&
       typeof key === "string" &&
       key.trim().length > 0 &&
       !/[<>:"|?*]/.test(key) &&
@@ -37,14 +32,14 @@ class S3Service {
     );
   }
 
-  _sanitizeKey(key) {
-    return key
-      .trim()
-      .replace(/\s+/g, "_")
-      .replace(/[<>:"|?*]/g, "");
+  _formatSize(bytes) {
+    if (!bytes) return "0 Bytes";
+    const units = ["Bytes", "KB", "MB", "GB"];
+    const i = Math.floor(Math.log(bytes) / Math.log(1024));
+    return parseFloat((bytes / Math.pow(1024, i)).toFixed(2)) + " " + units[i];
   }
 
-  _buildS3Url(key) {
+  _createS3Url(key) {
     return `https://${this.bucket}.s3.amazonaws.com/${encodeURIComponent(key)}`;
   }
 
@@ -52,93 +47,46 @@ class S3Service {
     try {
       const { key, fileType, expiresIn } = req.body;
 
-      // Input validation
-      if (!key || !fileType) {
-        handlers.logger.failed({
-          message: "Missing required fields: key and fileType",
-        });
+      if (!key || !fileType || !this.allowedFileTypes.has(fileType)) {
         return handlers.response.failed({
           res,
-          message: "Missing required fields: key and fileType",
+          message: "Invalid file type or key",
           statusCode: 400,
         });
       }
 
-      // Validate and sanitize key
-      if (!this._validateKey(key)) {
-        return handlers.response.failed({
-          res,
-          message:
-            "Invalid key format. Key must not contain special characters or be empty",
-          statusCode: 400,
-        });
-      }
-
-      // Validate file type
-      if (!this._validateFileType(fileType)) {
-        return handlers.response.failed({
-          res,
-          message: `Unsupported file type: ${fileType}. Allowed types: ${Array.from(
-            this.allowedFileTypes
-          ).join(", ")}`,
-          statusCode: 400,
-        });
-      }
-
-      const sanitizedKey = this._sanitizeKey(key);
-      const urlExpiration = expiresIn || this.defaultPresignedUrlExpiration;
-
-      // Check if file already exists (optional - remove if you want to allow overwrites)
+      // Check if file already exists
       try {
         await s3Client.send(
-          new HeadObjectCommand({
-            Bucket: this.bucket,
-            Key: sanitizedKey,
-          })
+          new HeadObjectCommand({ Bucket: this.bucket, Key: key })
         );
-
         return handlers.response.failed({
           res,
-          message: "File with this key already exists",
+          message: "File already exists",
           statusCode: 409,
         });
-      } catch (headError) {
-        // File doesn't exist, continue with upload
-        if (headError.name !== "NotFound") {
-          throw headError;
-        }
+      } catch (err) {
+        if (err.name !== "NotFound") throw err;
       }
 
       const command = new PutObjectCommand({
         Bucket: this.bucket,
-        Key: sanitizedKey,
+        Key: key,
         ContentType: fileType,
-        ACL: "public-read", // FIXED: Changed from "public" to "public-read"
+        ACL: "public-read",
       });
 
-      const presignedUrl = await getSignedUrl(s3Client, command, {
-        expiresIn: urlExpiration,
-      });
-
-      handlers.logger.success({
-        message: `Pre-signed URL generated for key: ${sanitizedKey}`,
+      const url = await getSignedUrl(s3Client, command, {
+        expiresIn: expiresIn || this.defaultPresignedUrlExpiration,
       });
 
       return handlers.response.success({
         res,
-        message: "Pre-signed URL generated successfully",
-        data: {
-          url: presignedUrl,
-          key: sanitizedKey,
-          expiresIn: urlExpiration,
-        },
+        message: "URL generated successfully",
+        data: { url, key },
       });
     } catch (error) {
-      handlers.logger.error({
-        message: `Upload URL generation failed: ${error.message}`,
-        error: error.stack,
-      });
-
+      console.error("Upload URL generation failed:", error);
       return handlers.response.error({
         res,
         message: "Failed to generate upload URL",
@@ -151,42 +99,25 @@ class S3Service {
     try {
       const { prefix, maxKeys = 1000, continuationToken } = req.query;
 
-      const command = new ListObjectsV2Command({
-        Bucket: this.bucket,
-        MaxKeys: Math.min(parseInt(maxKeys) || 1000, 1000), // Cap at 1000
-        Prefix: prefix || undefined,
-        ContinuationToken: continuationToken || undefined,
-      });
+      const data = await s3Client.send(
+        new ListObjectsV2Command({
+          Bucket: this.bucket,
+          MaxKeys: Math.min(+maxKeys, 1000), // Cap at 1000 for performance
+          Prefix: prefix,
+          ContinuationToken: continuationToken,
+        })
+      );
 
-      const data = await s3Client.send(command);
-
-      if (!data.Contents || data.Contents.length === 0) {
-        return handlers.response.success({
-          res,
-          message: "No files found",
-          data: {
-            files: [],
-            count: 0,
-            isTruncated: false,
-          },
-        });
-      }
-
-      const files = Array.from(
-        new Map(
-          data.Contents.map(item => [
-            item.Key,
-            {
-              Key: item.Key,
-              FileName: item.Key.split("/").pop(),
-              LastModified: item.LastModified,
-              Size: item.Size,
-              SizeFormatted: this._formatFileSize(item.Size),
-              Url: this._buildS3Url(item.Key),
-              ETag: item.ETag?.replace(/"/g, ""),
-            },
-          ])
-        ).values()
+      const files = (data.Contents || []).map(
+        ({ Key, LastModified, Size, ETag }) => ({
+          Key,
+          FileName: Key.split("/").pop(),
+          LastModified,
+          Size,
+          SizeFormatted: this._formatSize(Size),
+          Url: this._createS3Url(Key),
+          ETag: ETag?.replace(/"/g, ""),
+        })
       );
 
       return handlers.response.success({
@@ -195,172 +126,200 @@ class S3Service {
         data: {
           files,
           count: files.length,
-          isTruncated: data.IsTruncated || false,
-          nextContinuationToken: data.NextContinuationToken || null,
+          isTruncated: data.IsTruncated,
+          nextContinuationToken: data.NextContinuationToken,
         },
       });
     } catch (error) {
-      handlers.logger.error({
-        message: `Failed to list files: ${error.message}`,
-        error: error.stack,
-      });
-
+      console.error("Failed to list files:", error);
       return handlers.response.error({
         res,
-        message: "Failed to retrieve files",
+        message: "Failed to list files",
         statusCode: 500,
       });
     }
   }
 
   async deleteFileFromS3AndQdrant(req, res) {
+    const { key, collectionName = this.defaultCollectionName } = req.body;
+
+    // Validate input
+    if (!key || !this._validateKey(key)) {
+      return handlers.response.failed({
+        res,
+        message: "Invalid or missing key parameter",
+        statusCode: 400,
+      });
+    }
+
     try {
-      const { key, collectionName = this.defaultCollectionName } = req.body;
+      // Step 1: Verify file exists in S3
+      await this._verifyS3FileExists(key);
 
-      if (!key) {
-        return handlers.response.failed({
-          res,
-          message: "Missing required field: key",
-          statusCode: 400,
-        });
-      }
-
-      if (!this._validateKey(key)) {
-        return handlers.response.failed({
-          res,
-          message: "Invalid key format",
-          statusCode: 400,
-        });
-      }
-
-      // Check if file exists before attempting deletion
-      try {
-        await s3Client.send(
-          new HeadObjectCommand({
-            Bucket: this.bucket,
-            Key: key,
-          })
-        );
-      } catch (headError) {
-        if (headError.name === "NotFound") {
-          return handlers.response.failed({
-            res,
-            message: "File not found in S3",
-            statusCode: 404,
-          });
-        }
-        throw headError;
-      }
-
-      // Parallel operations for better performance
-      const [s3Result, qdrantResult] = await Promise.allSettled([
-        // Delete from S3
-        s3Client.send(
-          new DeleteObjectCommand({
-            Bucket: this.bucket,
-            Key: key,
-          })
-        ),
-
-        // Delete embeddings from Qdrant
-        this._deleteFromQdrant(key, collectionName),
+      // Step 2: Get DynamoDB record and ensure Qdrant collection exists
+      const [dynamoRecord] = await Promise.all([
+        this._getDynamoRecord(key),
+        createQdrantIndex(collectionName),
       ]);
 
-      // Check results
-      const s3Success = s3Result.status === "fulfilled";
-      const qdrantSuccess = qdrantResult.status === "fulfilled";
-
-      if (!s3Success && !qdrantSuccess) {
-        throw new Error(
-          `Both S3 and Qdrant deletions failed. S3: ${s3Result.reason?.message}, Qdrant: ${qdrantResult.reason?.message}`
-        );
+      if (!dynamoRecord) {
+        return handlers.response.failed({
+          res,
+          message: "File record not found in database",
+          statusCode: 404,
+        });
       }
 
-      const warnings = [];
-      if (!s3Success)
-        warnings.push(`S3 deletion failed: ${s3Result.reason?.message}`);
-      if (!qdrantSuccess)
-        warnings.push(
-          `Qdrant deletion failed: ${qdrantResult.reason?.message}`
-        );
-
-      handlers.logger.success({
-        message: `File deletion completed for key: ${key}`,
-        warnings: warnings.length > 0 ? warnings : undefined,
+      console.log("Found record for deletion:", {
+        fileId: dynamoRecord.FileId,
+        key,
       });
+
+      // Step 3: Perform all deletions atomically
+      await this._performAtomicDeletion(key, dynamoRecord, collectionName);
 
       return handlers.response.success({
         res,
-        message:
-          warnings.length > 0
-            ? "File deletion completed with warnings"
-            : "File and embeddings deleted successfully",
+        message: "File deleted successfully from all sources",
         data: {
           key,
-          deletedFromS3: s3Success,
-          deletedFromQdrant: qdrantSuccess,
-          deletedEmbeddings: qdrantSuccess
-            ? qdrantResult.value?.deletedCount || 0
-            : 0,
-          warnings: warnings.length > 0 ? warnings : undefined,
+          fileId: dynamoRecord.FileId,
+          deletedFromS3: true,
+          deletedFromQdrant: true,
+          deletedFromDynamoDB: true,
         },
       });
     } catch (error) {
-      handlers.logger.error({
-        message: `Deletion failed for key: ${req.body?.key}`,
-        error: error.stack,
-      });
+      console.error("Deletion failed:", error);
+
+      // Map specific errors to appropriate status codes
+      const statusCode = this._getErrorStatusCode(error);
 
       return handlers.response.error({
         res,
-        message: "Failed to delete file",
-        statusCode: 500,
+        message: `Deletion failed: ${error.message}`,
+        statusCode,
       });
     }
   }
 
-  // Helper method for Qdrant deletion
-  async _deleteFromQdrant(key, collectionName) {
+  async _verifyS3FileExists(key) {
     try {
-      console.log(key, collectionName);
+      await s3Client.send(
+        new HeadObjectCommand({ Bucket: this.bucket, Key: key })
+      );
+    } catch (err) {
+      if (err.name === "NotFound") {
+        const error = new Error("File not found in S3");
+        error.name = "FileNotFound";
+        throw error;
+      }
+      throw err;
+    }
+  }
 
-      await createQdrantIndex(collectionName);
-      return await deleteEmbeddingsByPayloadKey({
+  async _performAtomicDeletion(key, dynamoRecord, collectionName) {
+    // Prepare all deletion operations
+    const deletionPromises = [
+      // Delete from S3
+      s3Client
+        .send(new DeleteObjectCommand({ Bucket: this.bucket, Key: key }))
+        .catch(err => {
+          const error = new Error(`S3 deletion failed: ${err.message}`);
+          error.source = "S3";
+          throw error;
+        }),
+
+      // Delete from Qdrant
+      deleteEmbeddingsByPayloadKey({
         collectionName,
         key: "key",
         value: key,
-      });
+      }).catch(err => {
+        const error = new Error(`Qdrant deletion failed: ${err.message}`);
+        error.source = "Qdrant";
+        throw error;
+      }),
+
+      // Delete from DynamoDB
+      this.dynamoClient
+        .send(
+          new DeleteCommand({
+            TableName: this.dynamoTableName,
+            Key: { PK: dynamoRecord.PK, SK: dynamoRecord.SK },
+          })
+        )
+        .catch(err => {
+          const error = new Error(`DynamoDB deletion failed: ${err.message}`);
+          error.source = "DynamoDB";
+          throw error;
+        }),
+    ];
+
+    // Execute all deletions - if any fails, all fail
+    try {
+      await Promise.all(deletionPromises);
     } catch (error) {
-      console.error(`Qdrant deletion error for key ${key}:`, error);
-      throw error;
+      // Enhance error message with source information
+      throw new Error(
+        `${error.source || "Unknown"} deletion failed: ${error.message}`
+      );
     }
   }
 
-  // Helper method to format file sizes
-  _formatFileSize(bytes) {
-    if (bytes === 0) return "0 Bytes";
-    const k = 1024;
-    const sizes = ["Bytes", "KB", "MB", "GB"];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
+  async _getDynamoRecord(s3Key) {
+    const command = new QueryCommand({
+      TableName: this.dynamoTableName,
+      IndexName: "S3KeyIndex",
+      KeyConditionExpression: "#S3Key = :s3k",
+      ExpressionAttributeNames: { "#S3Key": "S3Key" },
+      ExpressionAttributeValues: { ":s3k": s3Key },
+      Limit: 1,
+    });
+
+    try {
+      const result = await this.dynamoClient.send(command);
+      return result.Items?.[0] || null;
+    } catch (error) {
+      throw new Error(`Failed to query DynamoDB: ${error.message}`);
+    }
   }
 
-  // Health check method
+  _getErrorStatusCode(error) {
+    if (error.name === "FileNotFound" || error.message.includes("not found")) {
+      return 404;
+    }
+    if (
+      error.message.includes("ValidationException") ||
+      error.message.includes("Invalid")
+    ) {
+      return 400;
+    }
+    return 500;
+  }
+
   async healthCheck(req, res) {
     try {
+      const startTime = Date.now();
+
       await s3Client.send(
-        new ListObjectsV2Command({
-          Bucket: this.bucket,
-          MaxKeys: 1,
-        })
+        new ListObjectsV2Command({ Bucket: this.bucket, MaxKeys: 1 })
       );
+
+      const responseTime = Date.now() - startTime;
 
       return handlers.response.success({
         res,
         message: "S3 service is healthy",
-        data: { status: "healthy", bucket: this.bucket },
+        data: {
+          status: "healthy",
+          bucket: this.bucket,
+          responseTime: `${responseTime}ms`,
+          timestamp: new Date().toISOString(),
+        },
       });
     } catch (error) {
+      console.error("Health check failed:", error);
       return handlers.response.error({
         res,
         message: "S3 service health check failed",

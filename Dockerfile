@@ -6,7 +6,7 @@ WORKDIR /var/task
 
 # Copy and install dependencies
 COPY package*.json ./
-RUN npm install
+RUN npm install || npm cache clean --force && npm install
 
 # Copy source code
 COPY . .

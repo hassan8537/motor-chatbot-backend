@@ -522,8 +522,6 @@ Clarity, brevity, and accuracy are essential.`,
         },
       };
 
-      console.log("📊 Sending metrics:", metricsData);
-
       return handlers.response.success({
         res,
         message: "Service metrics retrieved",
