@@ -9,4 +9,20 @@ router.post(
   controller.processUploadedPdf.bind(controller)
 );
 
+router.get("/metrics", authenticate, controller.getMetrics.bind(controller));
+
+router.post(
+  "/clear-caches",
+  authenticate,
+  controller.clearCaches.bind(controller)
+);
+
+router.get("/health", controller.healthCheck.bind(controller));
+
+router.get(
+  "/stats",
+  authenticate,
+  controller.getProcessingStats.bind(controller)
+);
+
 module.exports = router;

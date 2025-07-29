@@ -100,8 +100,8 @@ const executeWithRetry = async (
 };
 
 /**
- * Save a user query with metadata (model, temperature, total tokens, sources, metrics, etc.)
- * @param {Object} payload - Data to save
+ * Enhanced save query function optimized for drilling search service
+ * @param {Object} payload - Enhanced data to save with drilling optimizations
  * @param {string} payload.userId - User identifier
  * @param {string} payload.queryText - User's query text
  * @param {string} payload.answer - AI response text
@@ -112,24 +112,8 @@ const executeWithRetry = async (
  * @param {string} payload.tableName - DynamoDB table name
  * @param {Array} [payload.sources] - Array of source documents/chunks used
  * @param {Object} [payload.metrics] - Performance and processing metrics
- * @param {Object} [payload.metadata] - Additional metadata
- * @returns {Promise<Object>} - Save result
- */
-/**
- * Save a user query with metadata (model, temperature, total tokens, sources, metrics, etc.)
- * @param {Object} payload - Data to save
- * @param {string} payload.userId - User identifier
- * @param {string} payload.queryText - User's query text
- * @param {string} payload.answer - AI response text
- * @param {string} payload.model - AI model used
- * @param {number} payload.temperature - Model temperature setting
- * @param {number} [payload.totalTokens] - Total tokens used
- * @param {string} payload.timestamp - ISO timestamp
- * @param {string} payload.tableName - DynamoDB table name
- * @param {Array} [payload.sources] - Array of source documents/chunks used
- * @param {Object} [payload.metrics] - Performance and processing metrics
- * @param {Object} [payload.metadata] - Additional metadata
- * @returns {Promise<Object>} - Save result
+ * @param {Object} [payload.metadata] - Additional metadata including drilling-specific fields
+ * @returns {Promise<Object>} - Enhanced save result
  */
 const saveQuery = async ({
   userId,
@@ -144,7 +128,7 @@ const saveQuery = async ({
   metrics = {},
   metadata = {},
 }) => {
-  // Validate required parameters
+  // Enhanced validation for drilling queries
   const commonValidation = validateCommonParams({
     userId,
     timestamp,
@@ -154,7 +138,9 @@ const saveQuery = async ({
     return {
       success: false,
       error: new Error(
-        `Validation failed: ${commonValidation.errors.join(", ")}`
+        `Drilling query validation failed: ${commonValidation.errors.join(
+          ", "
+        )}`
       ),
     };
   }
@@ -169,7 +155,9 @@ const saveQuery = async ({
   if (additionalErrors.length > 0) {
     return {
       success: false,
-      error: new Error(`Validation failed: ${additionalErrors.join(", ")}`),
+      error: new Error(
+        `Drilling query validation failed: ${additionalErrors.join(", ")}`
+      ),
     };
   }
 
@@ -177,31 +165,69 @@ const saveQuery = async ({
   const PK = `QUERY#${queryId}`;
   const SK = `USER#${userId}#QUERY#${queryId}`;
 
-  // Calculate text statistics
+  // Enhanced text statistics
   const queryWordCount = queryText.trim().split(/\s+/).length;
   const answerWordCount = answer.trim().split(/\s+/).length;
 
-  // Validate and sanitize sources array
+  // Analyze query characteristics
+  const queryAnalysis = analyzeQueryCharacteristics(queryText);
+
+  // Enhanced source validation and sanitization
   const sanitizedSources = Array.isArray(sources)
     ? sources.map((source, index) => ({
         FileName: source.FileName || source.fileName || `Document ${index + 1}`,
         ChunkIndex: source.ChunkIndex || source.chunkIndex || index,
         Score: source.Score || source.score || "0.00",
+        ContentType: source.ContentType || source.contentType || "general",
+        HasStructuredData:
+          source.HasStructuredData || source.hasStructuredData || false,
         ...source, // Include any additional source properties
       }))
     : [];
 
-  // Validate and sanitize metrics object
+  // Enhanced metrics validation and sanitization
   const sanitizedMetrics = {
     totalRequestTimeMs: metrics.totalRequestTimeMs || 0,
     cached: metrics.cached || false,
     embeddingFromCache: metrics.embeddingFromCache || false,
     resultsCount: metrics.resultsCount || 0,
     tokensUsed: metrics.tokensUsed || totalTokens || 0,
+    // Drilling-specific metrics from enhanced search service
+    processingVersion: metrics.processingVersion || "2.0-drilling-optimized",
+    queryComplexity: metrics.queryComplexity || 1,
+    technicalTermsFound: metrics.technicalTermsFound || 0,
+    embeddingEnhancements: metrics.embeddingEnhancements || 0,
     ...metrics, // Include any additional metrics
   };
 
+  // Enhanced metadata processing
+  const enhancedMetadata = {
+    // Query classification
+    queryType: metadata.queryType || queryAnalysis.type,
+    isDrillingQuery: metadata.isDrillingQuery || queryAnalysis.isDrilling,
+    isAggregationQuery:
+      metadata.isAggregationQuery || queryAnalysis.isAggregation,
+    isComparisonQuery: metadata.isComparisonQuery || queryAnalysis.isComparison,
+
+    // Technical analysis
+    technicalTermsCount:
+      metadata.technicalTermsCount || queryAnalysis.technicalTermsCount,
+    complexityScore: metadata.complexityScore || queryAnalysis.complexityScore,
+
+    // Processing metadata
+    processingVersion: metadata.processingVersion || "2.0-drilling-optimized",
+    searchOptimized: metadata.searchOptimized || true,
+
+    // Response quality indicators
+    hasStructuredSources: sanitizedSources.some(s => s.HasStructuredData),
+    averageSourceScore: calculateAverageSourceScore(sanitizedSources),
+
+    ...metadata, // Include any additional metadata
+  };
+
+  // Build enhanced item with drilling optimizations
   const item = {
+    // Core fields
     PK,
     SK,
     EntityType: "Chat",
@@ -212,24 +238,71 @@ const saveQuery = async ({
     Model: model,
     Temperature: temperature,
     TotalTokens: totalTokens,
+
+    // Enhanced statistics
     QueryWordCount: queryWordCount,
     AnswerWordCount: answerWordCount,
-    // Use lowercase field names to match what Service class expects
+    QueryLength: queryText.trim().length,
+    AnswerLength: answer.trim().length,
+
+    // Enhanced source information
     sources: sanitizedSources,
-    metrics: sanitizedMetrics,
     SourcesCount: sanitizedSources.length,
+    StructuredSourcesCount: sanitizedSources.filter(s => s.HasStructuredData)
+      .length,
+
+    // Enhanced metrics
+    metrics: sanitizedMetrics,
+
+    // Query classification and analysis
+    QueryType: enhancedMetadata.queryType,
+    IsDrillingQuery: enhancedMetadata.isDrillingQuery,
+    IsAggregationQuery: enhancedMetadata.isAggregationQuery,
+    IsComparisonQuery: enhancedMetadata.isComparisonQuery,
+
+    // Technical analysis
+    TechnicalTermsCount: enhancedMetadata.technicalTermsCount,
+    ComplexityScore: enhancedMetadata.complexityScore,
+
+    // Response quality metrics
+    HasStructuredSources: enhancedMetadata.hasStructuredSources,
+    AverageSourceScore: enhancedMetadata.averageSourceScore,
+
+    // Processing metadata
+    ProcessingVersion: enhancedMetadata.processingVersion,
+    SearchOptimized: enhancedMetadata.searchOptimized,
+
+    // Searchable fields for better discovery
+    SearchableTerms: extractSearchableTerms(queryText, answer),
+
+    // Timestamps and TTL
     CreatedAt: timestamp,
     UpdatedAt: timestamp,
-    TTL: Math.floor(Date.now() / 1000) + 365 * 24 * 60 * 60, // 1 year TTL
-    ...metadata, // Spread additional metadata
+    TTL:
+      Math.floor(Date.now() / 1000) +
+      (enhancedMetadata.isDrillingQuery ? 18 : 12) * 30 * 24 * 60 * 60, // 18 months for drilling queries, 12 for others
+
+    // Additional metadata
+    ...enhancedMetadata,
   };
 
-  console.log("💾 Saving query with sources and metrics:", {
+  // Add GSI fields for drilling queries
+  if (enhancedMetadata.isDrillingQuery) {
+    item.GSI1PK = `DRILLING#${enhancedMetadata.queryType.toUpperCase()}`;
+    item.GSI1SK = `USER#${userId}#${timestamp}`;
+    item.GSI2PK = `USER#${userId}#DRILLING`;
+    item.GSI2SK = `COMPLEXITY#${enhancedMetadata.complexityScore}#${timestamp}`;
+  }
+
+  console.log("💾 Saving enhanced drilling query:", {
     queryId,
+    queryType: enhancedMetadata.queryType,
+    isDrillingQuery: enhancedMetadata.isDrillingQuery,
     sourcesCount: sanitizedSources.length,
+    structuredSources: item.StructuredSourcesCount,
+    technicalTerms: enhancedMetadata.technicalTermsCount,
+    complexity: enhancedMetadata.complexityScore,
     metricsKeys: Object.keys(sanitizedMetrics),
-    sources: sanitizedSources,
-    metrics: sanitizedMetrics,
   });
 
   const operation = () =>
@@ -241,12 +314,21 @@ const saveQuery = async ({
       })
     );
 
-  const result = await executeWithRetry(operation, "Save Query");
+  const result = await executeWithRetry(
+    operation,
+    "Save Enhanced Drilling Query"
+  );
 
   if (result.success) {
-    console.log(
-      `✅ Query saved successfully. QueryId: ${queryId}, Tokens: ${totalTokens}, Sources: ${sanitizedSources.length}`
-    );
+    console.log(`✅ Enhanced drilling query saved successfully:`, {
+      queryId,
+      type: enhancedMetadata.queryType,
+      drilling: enhancedMetadata.isDrillingQuery,
+      tokens: totalTokens,
+      sources: sanitizedSources.length,
+      complexity: enhancedMetadata.complexityScore,
+    });
+
     return {
       success: true,
       queryId,
@@ -258,18 +340,171 @@ const saveQuery = async ({
         queryWordCount,
         answerWordCount,
         sourcesCount: sanitizedSources.length,
+        structuredSourcesCount: item.StructuredSourcesCount,
+        queryType: enhancedMetadata.queryType,
+        isDrillingQuery: enhancedMetadata.isDrillingQuery,
+        technicalTermsCount: enhancedMetadata.technicalTermsCount,
+        complexityScore: enhancedMetadata.complexityScore,
         metrics: sanitizedMetrics,
+        processingVersion: enhancedMetadata.processingVersion,
+        searchOptimized: true,
       },
     };
   }
 
-  console.error("❌ Failed to save query:", result.message);
+  console.error("❌ Failed to save enhanced drilling query:", result.message);
   return result;
 };
 
+// ========== UTILITY FUNCTIONS ==========
+
 /**
- * Save file details with enhanced metadata
- * @param {Object} payload - File data to save
+ * Analyze query characteristics for enhanced classification
+ */
+function analyzeQueryCharacteristics(queryText) {
+  const lowerQuery = queryText.toLowerCase();
+
+  // Technical terms analysis
+  const drillingTerms = [
+    "motor",
+    "stator",
+    "bit",
+    "bha",
+    "rop",
+    "wob",
+    "tfa",
+    "drilling",
+    "circulation",
+    "slide",
+    "rotary",
+    "footage",
+    "nmdc",
+    "ubho",
+    "float sub",
+    "shock sub",
+    "differential pressure",
+    "pickup weight",
+    "total drilled",
+    "drilling hours",
+  ];
+
+  const aggregationTerms = [
+    "most used",
+    "average",
+    "total",
+    "highest",
+    "lowest",
+    "common",
+    "typical",
+    "median",
+    "sum of",
+    "count of",
+  ];
+
+  const comparisonTerms = [
+    "vs",
+    "versus",
+    "compare",
+    "difference",
+    "better than",
+    "worse than",
+    "higher than",
+    "lower than",
+  ];
+
+  // Count technical terms
+  const technicalTermsCount = drillingTerms.filter(term =>
+    lowerQuery.includes(term)
+  ).length;
+
+  // Determine query characteristics
+  const isDrilling = technicalTermsCount > 0;
+  const isAggregation = aggregationTerms.some(term =>
+    lowerQuery.includes(term)
+  );
+  const isComparison = comparisonTerms.some(term => lowerQuery.includes(term));
+
+  // Determine query type
+  let type = "general";
+  if (isAggregation) type = "aggregation";
+  else if (isComparison) type = "comparison";
+  else if (isDrilling) type = "drilling";
+
+  // Calculate complexity score
+  let complexityScore = 1;
+  if (isAggregation) complexityScore += 2;
+  if (isComparison) complexityScore += 1;
+  if (technicalTermsCount > 3) complexityScore += 1;
+  if (queryText.length > 100) complexityScore += 1;
+  complexityScore = Math.min(complexityScore, 5);
+
+  return {
+    type,
+    isDrilling,
+    isAggregation,
+    isComparison,
+    technicalTermsCount,
+    complexityScore,
+  };
+}
+
+/**
+ * Calculate average source score
+ */
+function calculateAverageSourceScore(sources) {
+  if (sources.length === 0) return 0;
+
+  const totalScore = sources.reduce((sum, source) => {
+    const score = parseFloat(source.Score) || 0;
+    return sum + score;
+  }, 0);
+
+  return Math.round((totalScore / sources.length) * 100) / 100;
+}
+
+/**
+ * Extract searchable terms from query and answer
+ */
+function extractSearchableTerms(queryText, answer) {
+  const terms = new Set();
+
+  // Extract from query
+  const queryWords = queryText
+    .toLowerCase()
+    .replace(/[^\w\s]/g, " ")
+    .split(/\s+/)
+    .filter(word => word.length > 3);
+
+  queryWords.forEach(word => terms.add(word));
+
+  // Extract technical terms from answer
+  const technicalTerms = [
+    "motor",
+    "stator",
+    "bit",
+    "bha",
+    "rop",
+    "wob",
+    "tfa",
+    "drilling",
+    "circulation",
+    "slide",
+    "rotary",
+  ];
+
+  const answerLower = answer.toLowerCase();
+  technicalTerms.forEach(term => {
+    if (answerLower.includes(term)) {
+      terms.add(term);
+    }
+  });
+
+  return Array.from(terms).slice(0, 15); // Limit to 15 terms
+}
+
+/**
+ * Enhanced save file details with drilling-specific metadata and optimizations
+ * @param {Object} payload - Enhanced file data to save
  * @param {string} payload.userId - User identifier
  * @param {string} payload.fileName - Original file name
  * @param {string} payload.key - S3 object key
@@ -280,9 +515,17 @@ const saveQuery = async ({
  * @param {number} [payload.totalChunks] - Number of text chunks
  * @param {number} [payload.successfulChunks] - Successfully processed chunks
  * @param {number} [payload.textLength] - Extracted text length
+ * @param {number} [payload.processingTimeMs] - Total processing time
  * @param {number} [payload.fileSize] - File size in bytes
+ * @param {string} [payload.documentType] - Detected document type (BHA, MMR, RVEN)
+ * @param {string} [payload.extractionMethod] - Text extraction method used
+ * @param {number} [payload.embeddingSuccessRate] - Embedding processing success rate
+ * @param {number} [payload.averageChunkLength] - Average chunk length
+ * @param {boolean} [payload.isDrillingReport] - Whether this is a drilling report
+ * @param {string} [payload.processingVersion] - Processing pipeline version
+ * @param {Object} [payload.qualityMetrics] - Content quality assessment metrics
  * @param {Object} [payload.metadata] - Additional metadata
- * @returns {Promise<Object>} - Save result
+ * @returns {Promise<Object>} - Enhanced save result
  */
 const saveFileDetails = async ({
   userId,
@@ -295,19 +538,31 @@ const saveFileDetails = async ({
   totalChunks = 0,
   successfulChunks = 0,
   textLength = 0,
+  processingTimeMs = 0,
   fileSize = 0,
+  // Enhanced drilling-specific fields
+  documentType = null,
+  extractionMethod = null,
+  embeddingSuccessRate = null,
+  averageChunkLength = null,
+  isDrillingReport = false,
+  processingVersion = "2.0-drilling-optimized",
+  qualityMetrics = {},
   metadata = {},
 }) => {
-  console.log("Saving file details to DynamoDB...", {
+  console.log("💾 Saving enhanced drilling report details to DynamoDB...", {
     userId,
     fileName,
     key,
     collectionName,
     totalChunks,
     successfulChunks,
+    documentType,
+    isDrillingReport,
+    processingVersion,
   });
 
-  // Validate required parameters
+  // Enhanced validation for drilling reports
   const commonValidation = validateCommonParams({
     userId,
     timestamp,
@@ -317,7 +572,9 @@ const saveFileDetails = async ({
     return {
       success: false,
       error: new Error(
-        `Validation failed: ${commonValidation.errors.join(", ")}`
+        `Drilling report validation failed: ${commonValidation.errors.join(
+          ", "
+        )}`
       ),
     };
   }
@@ -329,10 +586,28 @@ const saveFileDetails = async ({
     additionalErrors.push("Collection name is required");
   if (!bucketName?.trim()) additionalErrors.push("Bucket name is required");
 
+  // Enhanced validation for drilling-specific fields
+  if (isDrillingReport) {
+    if (
+      documentType &&
+      !["BHA", "MMR", "RVEN", "DRILLING"].includes(documentType)
+    ) {
+      additionalErrors.push("Invalid document type for drilling report");
+    }
+    if (
+      embeddingSuccessRate !== null &&
+      (embeddingSuccessRate < 0 || embeddingSuccessRate > 1)
+    ) {
+      additionalErrors.push("Embedding success rate must be between 0 and 1");
+    }
+  }
+
   if (additionalErrors.length > 0) {
     return {
       success: false,
-      error: new Error(`Validation failed: ${additionalErrors.join(", ")}`),
+      error: new Error(
+        `Drilling report validation failed: ${additionalErrors.join(", ")}`
+      ),
     };
   }
 
@@ -340,20 +615,45 @@ const saveFileDetails = async ({
   const PK = `FILE#${fileId}`;
   const SK = `USER#${userId}#FILE#${fileId}`;
 
-  // Generate public URL (consider making this configurable)
-  const encodedKey = encodeURIComponent(key);
-  const publicUrl = `https://${bucketName}.s3.amazonaws.com/${encodedKey}`;
-
-  // Extract file extension and MIME type
+  // Enhanced file analysis
   const fileExtension = fileName.split(".").pop()?.toLowerCase() || "";
   const mimeType =
     fileExtension === "pdf" ? "application/pdf" : "application/octet-stream";
 
-  // Calculate processing statistics
+  // Enhanced drilling document type detection
+  const detectedDocType = detectDrillingDocumentType(fileName, documentType);
+
+  // Calculate enhanced processing statistics
   const processingSuccess =
     totalChunks > 0 ? (successfulChunks / totalChunks) * 100 : 0;
+  const embeddingSuccessPercent =
+    embeddingSuccessRate !== null ? embeddingSuccessRate * 100 : null;
 
+  // Calculate processing efficiency metrics
+  const processingEfficiency = calculateProcessingEfficiency({
+    processingTimeMs,
+    totalChunks,
+    textLength,
+    successfulChunks,
+  });
+
+  // Enhanced public URL generation
+  const encodedKey = encodeURIComponent(key);
+  const publicUrl = `https://${bucketName}.s3.amazonaws.com/${encodedKey}`;
+
+  // Create enhanced drilling-specific metadata
+  const drillingMetadata = createDrillingMetadata({
+    documentType: detectedDocType,
+    extractionMethod,
+    embeddingSuccessRate,
+    averageChunkLength,
+    qualityMetrics,
+    processingEfficiency,
+  });
+
+  // Build enhanced item with drilling optimizations
   const item = {
+    // Core fields
     PK,
     SK,
     EntityType: "File",
@@ -366,18 +666,70 @@ const saveFileDetails = async ({
     S3Bucket: bucketName,
     PublicUrl: publicUrl,
     Collection: collectionName,
+
+    // Basic metrics
     FileSize: fileSize,
     TextLength: textLength,
     TotalChunks: totalChunks,
     SuccessfulChunks: successfulChunks,
-    ProcessingSuccessRate: Math.round(processingSuccess * 100) / 100, // Round to 2 decimals
-    ProcessingStatus:
-      successfulChunks === totalChunks ? "completed" : "partial",
+    ProcessingTimeMs: processingTimeMs,
+
+    // Enhanced processing metrics
+    ProcessingSuccessRate: Math.round(processingSuccess * 100) / 100,
+    ProcessingStatus: determineProcessingStatus(
+      successfulChunks,
+      totalChunks,
+      embeddingSuccessRate
+    ),
+    ProcessingEfficiency: processingEfficiency,
+
+    // Drilling-specific fields
+    IsDrillingReport: isDrillingReport,
+    DocumentType: detectedDocType,
+    DocumentCategory: categorizeDrillingDocument(detectedDocType),
+    ExtractionMethod: extractionMethod,
+    EmbeddingSuccessRate: embeddingSuccessPercent,
+    AverageChunkLength: averageChunkLength,
+    ProcessingVersion: processingVersion,
+
+    // Enhanced drilling metadata
+    DrillingMetadata: drillingMetadata,
+
+    // Quality assessment
+    ContentQuality: assessContentQuality({
+      textLength,
+      totalChunks,
+      successfulChunks,
+      embeddingSuccessRate,
+      qualityMetrics,
+    }),
+
+    // Search optimization fields
+    SearchableFields: createSearchableFields({
+      fileName,
+      documentType: detectedDocType,
+      extractionMethod,
+      isDrillingReport,
+    }),
+
+    // Timestamps and TTL
     CreatedAt: timestamp,
     UpdatedAt: timestamp,
-    TTL: Math.floor(Date.now() / 1000) + 2 * 365 * 24 * 60 * 60, // 2 years TTL
-    ...metadata, // Spread additional metadata
+    TTL:
+      Math.floor(Date.now() / 1000) +
+      (isDrillingReport ? 3 * 365 * 24 * 60 * 60 : 2 * 365 * 24 * 60 * 60), // 3 years for drilling reports, 2 for others
+
+    // Additional metadata
+    ...metadata,
   };
+
+  // Add drilling-specific GSI fields for better querying
+  if (isDrillingReport) {
+    item.GSI1PK = `DRILLING#${detectedDocType || "UNKNOWN"}`;
+    item.GSI1SK = `USER#${userId}#${timestamp}`;
+    item.GSI2PK = `USER#${userId}#DRILLING`;
+    item.GSI2SK = `TYPE#${detectedDocType || "UNKNOWN"}#${timestamp}`;
+  }
 
   const operation = () =>
     docClient.send(
@@ -388,12 +740,25 @@ const saveFileDetails = async ({
       })
     );
 
-  const result = await executeWithRetry(operation, "Save File Details");
+  const result = await executeWithRetry(
+    operation,
+    "Save Enhanced Drilling File Details"
+  );
 
   if (result.success) {
+    const logData = {
+      fileId,
+      documentType: detectedDocType,
+      chunks: `${successfulChunks}/${totalChunks}`,
+      processingTime: `${processingTimeMs}ms`,
+      efficiency: processingEfficiency.overallScore.toFixed(2),
+    };
+
     console.log(
-      `File details saved successfully. FileId: ${fileId}, Chunks: ${successfulChunks}/${totalChunks}`
+      `✅ Enhanced drilling file details saved successfully:`,
+      logData
     );
+
     return {
       success: true,
       fileId,
@@ -401,17 +766,323 @@ const saveFileDetails = async ({
         fileId,
         userId,
         fileName,
+        documentType: detectedDocType,
         totalChunks,
         successfulChunks,
         processingSuccessRate: Math.round(processingSuccess * 100) / 100,
+        embeddingSuccessRate: embeddingSuccessPercent,
+        processingTimeMs,
+        processingEfficiency: processingEfficiency.overallScore,
         publicUrl,
+        isDrillingReport,
+        processingVersion,
+        contentQuality: item.ContentQuality,
+        drillingOptimized: true,
       },
     };
   }
 
-  console.error("Failed to save file details:", result.message);
+  console.error(
+    "❌ Failed to save enhanced drilling file details:",
+    result.message
+  );
   return result;
 };
+
+/**
+ * Detect drilling document type from filename and provided type
+ */
+function detectDrillingDocumentType(fileName, providedType) {
+  if (providedType && ["BHA", "MMR", "RVEN"].includes(providedType)) {
+    return providedType;
+  }
+
+  const name = fileName.toLowerCase();
+  if (name.includes("bha")) return "BHA";
+  if (name.includes("mmr")) return "MMR";
+  if (name.includes("rven")) return "RVEN";
+  if (name.includes("drill") || name.includes("motor") || name.includes("bit"))
+    return "DRILLING";
+
+  return null;
+}
+
+/**
+ * Categorize drilling document for organization
+ */
+function categorizeDrillingDocument(documentType) {
+  const categories = {
+    BHA: "Assembly_Reports",
+    MMR: "Motor_Reports",
+    RVEN: "Evaluation_Reports",
+    DRILLING: "General_Drilling",
+  };
+
+  return categories[documentType] || "Unknown";
+}
+
+/**
+ * Calculate processing efficiency metrics
+ */
+function calculateProcessingEfficiency({
+  processingTimeMs,
+  totalChunks,
+  textLength,
+  successfulChunks,
+}) {
+  const efficiency = {
+    timePerChunk: totalChunks > 0 ? processingTimeMs / totalChunks : 0,
+    timePerCharacter: textLength > 0 ? processingTimeMs / textLength : 0,
+    successRate: totalChunks > 0 ? successfulChunks / totalChunks : 0,
+    throughput:
+      processingTimeMs > 0 ? (successfulChunks / processingTimeMs) * 1000 : 0, // chunks per second
+    overallScore: 0,
+  };
+
+  // Calculate overall efficiency score (0-100)
+  let score = 0;
+  if (efficiency.successRate >= 0.9) score += 40;
+  else if (efficiency.successRate >= 0.7) score += 30;
+  else if (efficiency.successRate >= 0.5) score += 20;
+
+  if (efficiency.timePerChunk < 1000) score += 30; // Under 1 second per chunk
+  else if (efficiency.timePerChunk < 2000) score += 20;
+  else if (efficiency.timePerChunk < 5000) score += 10;
+
+  if (efficiency.throughput > 1) score += 20; // More than 1 chunk per second
+  else if (efficiency.throughput > 0.5) score += 15;
+  else if (efficiency.throughput > 0.1) score += 10;
+
+  efficiency.overallScore = Math.min(score, 100);
+  return efficiency;
+}
+
+/**
+ * Create drilling-specific metadata object
+ */
+function createDrillingMetadata({
+  documentType,
+  extractionMethod,
+  embeddingSuccessRate,
+  averageChunkLength,
+  qualityMetrics,
+  processingEfficiency,
+}) {
+  const metadata = {
+    hasStructuredData: qualityMetrics.hasStructuredData || false,
+    hasTechnicalMetrics: qualityMetrics.hasTechnicalMetrics || false,
+    ocrUsed:
+      extractionMethod &&
+      (extractionMethod.includes("ocr") ||
+        extractionMethod.includes("tesseract")),
+    highQualityExtraction: (embeddingSuccessRate || 0) > 0.8,
+    processingComplexity: determineProcessingComplexity(
+      averageChunkLength,
+      extractionMethod
+    ),
+    dataRichness: assessDataRichness({ averageChunkLength, qualityMetrics }),
+    optimizationApplied: true,
+  };
+
+  // Add document-specific metadata
+  if (documentType) {
+    metadata.documentSpecificFields = getDocumentSpecificFields(documentType);
+  }
+
+  return metadata;
+}
+
+/**
+ * Determine processing complexity level
+ */
+function determineProcessingComplexity(averageChunkLength, extractionMethod) {
+  let complexity = "SIMPLE";
+
+  if (
+    extractionMethod &&
+    (extractionMethod.includes("ocr") || extractionMethod.includes("tesseract"))
+  ) {
+    complexity = "COMPLEX";
+  } else if (
+    extractionMethod &&
+    extractionMethod.includes("structure-preserving")
+  ) {
+    complexity = "MODERATE";
+  }
+
+  if (averageChunkLength && averageChunkLength > 1500) {
+    complexity = complexity === "SIMPLE" ? "MODERATE" : "COMPLEX";
+  }
+
+  return complexity;
+}
+
+/**
+ * Assess data richness of the processed content
+ */
+function assessDataRichness({ averageChunkLength, qualityMetrics }) {
+  let richness = "LOW";
+  let score = 0;
+
+  if (averageChunkLength > 1000) score += 2;
+  else if (averageChunkLength > 500) score += 1;
+
+  if (qualityMetrics.hasStructuredData) score += 2;
+  if (qualityMetrics.hasTechnicalMetrics) score += 2;
+  if (qualityMetrics.numericalDataCount > 10) score += 1;
+
+  if (score >= 5) richness = "HIGH";
+  else if (score >= 3) richness = "MODERATE";
+
+  return richness;
+}
+
+/**
+ * Get document type specific fields for metadata
+ */
+function getDocumentSpecificFields(documentType) {
+  const fields = {
+    BHA: ["motorSpecs", "bitData", "assemblyComponents", "performanceMetrics"],
+    MMR: [
+      "motorMeasurements",
+      "statorData",
+      "pressureReadings",
+      "conditionAssessment",
+    ],
+    RVEN: [
+      "runEvaluation",
+      "performanceNotes",
+      "equipmentCondition",
+      "recommendations",
+    ],
+    DRILLING: ["generalSpecs", "operationalData", "technicalMetrics"],
+  };
+
+  return fields[documentType] || [];
+}
+
+/**
+ * Determine processing status with enhanced logic
+ */
+function determineProcessingStatus(
+  successfulChunks,
+  totalChunks,
+  embeddingSuccessRate
+) {
+  if (totalChunks === 0) return "no_content";
+
+  const chunkSuccessRate = successfulChunks / totalChunks;
+  const overallSuccessRate =
+    embeddingSuccessRate !== null
+      ? Math.min(chunkSuccessRate, embeddingSuccessRate)
+      : chunkSuccessRate;
+
+  if (overallSuccessRate >= 0.95) return "completed";
+  if (overallSuccessRate >= 0.8) return "mostly_successful";
+  if (overallSuccessRate >= 0.6) return "partial";
+  if (overallSuccessRate >= 0.3) return "limited";
+  return "failed";
+}
+
+/**
+ * Assess overall content quality
+ */
+function assessContentQuality({
+  textLength,
+  totalChunks,
+  successfulChunks,
+  embeddingSuccessRate,
+  qualityMetrics,
+}) {
+  let quality = {
+    score: 0,
+    level: "LOW",
+    factors: [],
+  };
+
+  // Text length assessment
+  if (textLength > 5000) {
+    quality.score += 20;
+    quality.factors.push("sufficient_text_length");
+  } else if (textLength > 1000) {
+    quality.score += 10;
+  }
+
+  // Chunk processing success
+  const chunkSuccess = totalChunks > 0 ? successfulChunks / totalChunks : 0;
+  if (chunkSuccess >= 0.9) {
+    quality.score += 25;
+    quality.factors.push("high_chunk_success");
+  } else if (chunkSuccess >= 0.7) {
+    quality.score += 15;
+  }
+
+  // Embedding success
+  if (embeddingSuccessRate !== null) {
+    if (embeddingSuccessRate >= 0.9) {
+      quality.score += 25;
+      quality.factors.push("high_embedding_success");
+    } else if (embeddingSuccessRate >= 0.7) {
+      quality.score += 15;
+    }
+  }
+
+  // Quality metrics assessment
+  if (qualityMetrics.hasStructuredData) {
+    quality.score += 15;
+    quality.factors.push("structured_data_present");
+  }
+
+  if (qualityMetrics.hasTechnicalMetrics) {
+    quality.score += 15;
+    quality.factors.push("technical_metrics_present");
+  }
+
+  // Determine quality level
+  if (quality.score >= 80) quality.level = "HIGH";
+  else if (quality.score >= 60) quality.level = "MODERATE";
+  else if (quality.score >= 40) quality.level = "FAIR";
+  else quality.level = "LOW";
+
+  return quality;
+}
+
+/**
+ * Create searchable fields for better discoverability
+ */
+function createSearchableFields({
+  fileName,
+  documentType,
+  extractionMethod,
+  isDrillingReport,
+}) {
+  const fields = [];
+
+  // File name components
+  const nameWords = fileName
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+  fields.push(...nameWords);
+
+  // Document type
+  if (documentType) {
+    fields.push(documentType.toLowerCase());
+  }
+
+  // Extraction method
+  if (extractionMethod) {
+    fields.push(extractionMethod.toLowerCase().replace(/[^a-z0-9]/g, "_"));
+  }
+
+  // Drilling-specific terms
+  if (isDrillingReport) {
+    fields.push("drilling", "report", "technical", "performance");
+  }
+
+  return [...new Set(fields)]; // Remove duplicates
+}
 
 /**
  * Save multiple items in batch (useful for bulk operations)

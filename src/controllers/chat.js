@@ -11,6 +11,14 @@ class Controllers {
     return await this.service.chats(req, res);
   }
 
+  async delete(req, res) {
+    return await this.service.deleteAllUserChats(req, res);
+  }
+
+  async count(req, res) {
+    return await this.service.getUserChatCount(req, res);
+  }
+
   async getMetrics(req, res) {
     return await this.service.getMetrics(req, res);
   }
