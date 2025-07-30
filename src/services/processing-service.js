@@ -1,6 +1,6 @@
 const { handlers } = require("../utilities/handlers");
-const extractFromPDF = require("../utilities/pdf-parser");
-const chunkText = require("../utilities/chunk-text");
+const { extractFromPDF, extractTextAuto } = require("../utilities/pdf-parser"); // Updated import
+const chunkText = require("../utilities/chunk-text"); // Updated import
 const getEmbedding = require("../utilities/get-embedding");
 const { v4: uuidv4 } = require("uuid");
 const { s3Client } = require("../config/aws");
@@ -9,32 +9,33 @@ const path = require("path");
 const { saveFileDetails } = require("../utilities/save-query");
 const { Readable } = require("stream");
 const upsertEmbedding = require("../utilities/upsert-embedding");
+const { pdfBufferToText } = require("../utilities/pdf-extractor");
 
-// 🚀 Enhanced Constants for Drilling Reports
-const MAX_CONCURRENT_EMBEDDINGS = 12; // Increased for better throughput
-const MAX_CONCURRENT_UPLOADS = 15;
+// Universal Constants - Works for any document type
+const MAX_CONCURRENT_EMBEDDINGS = 10;
+const MAX_CONCURRENT_UPLOADS = 12;
 const MAX_RETRY_ATTEMPTS = 3;
 const RETRY_DELAY_MS = 500;
 const SUPPORTED_FILE_TYPES = [".pdf"];
-const MAX_FILE_SIZE = 75 * 1024 * 1024; // Increased to 75MB for larger drilling reports
-const STREAM_TIMEOUT_MS = 60000; // Increased timeout for large files
-const BATCH_PROCESSING_DELAY = 30; // Reduced delay for faster processing
-const MIN_TEXT_LENGTH = 100; // Higher minimum for technical content
-const DRILLING_QUALITY_THRESHOLD = 0.6; // Quality threshold for drilling content
+const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100MB for any large documents
+const STREAM_TIMEOUT_MS = 90000; // 90 seconds for large files
+const BATCH_PROCESSING_DELAY = 50;
+const MIN_TEXT_LENGTH = 100; // Minimum text for any content
+const QUALITY_THRESHOLD = 0.3; // Lowered threshold for more flexibility
 
-// 📊 Enhanced Rate limiting for drilling document processing
+// Universal Rate limiting for document processing
 const EMBEDDING_RATE_LIMIT = {
-  maxRequests: 150, // Increased for better throughput
+  maxRequests: 120,
   windowMs: 60000,
   requests: [],
 };
 
-class EnhancedDrillingDocumentService {
+class ProcessingService {
   constructor() {
     this.bucket = process.env.BUCKET_NAME;
     this.tableName = process.env.DYNAMODB_TABLE_NAME;
 
-    // 📊 Enhanced metrics tracking for drilling reports
+    // Universal metrics tracking
     this.metrics = {
       totalProcessed: 0,
       totalErrors: 0,
@@ -42,14 +43,10 @@ class EnhancedDrillingDocumentService {
       averageProcessingTime: 0,
       totalChunksProcessed: 0,
       totalTextExtracted: 0,
-      drillingSpecificMetrics: {
-        bhaReports: 0,
-        mmrReports: 0,
-        rvenReports: 0,
-        averageQualityScore: 0,
-        structuredDataExtractions: 0,
-        ocrFallbacks: 0,
-      },
+      averageQualityScore: 0,
+      digitalTextSuccess: 0,
+      ocrFallbacks: 0,
+      hybridExtractions: 0,
       errorTypes: {
         textExtraction: 0,
         chunking: 0,
@@ -59,13 +56,18 @@ class EnhancedDrillingDocumentService {
         validation: 0,
         qualityCheck: 0,
       },
+      extractionMethods: {
+        digitalOnly: 0,
+        ocrOnly: 0,
+        hybrid: 0,
+        autoSelected: 0,
+      },
     };
 
-    // 🧠 Enhanced caching for drilling content
+    // Universal caching
     this.textCache = new Map();
     this.chunkCache = new Map();
-    this.qualityCache = new Map(); // Cache quality assessments
-    this.CACHE_TTL_MS = 45 * 60 * 1000; // Extended to 45 minutes
+    this.CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
     // Validate required environment variables
     if (!this.bucket || !this.tableName) {
@@ -75,12 +77,12 @@ class EnhancedDrillingDocumentService {
     }
 
     console.log(
-      "🚀 Enhanced Drilling Document Service initialized with advanced optimizations"
+      "🚀 Universal Document Service initialized - Smart PDF extraction enabled"
     );
   }
 
   /**
-   * 🗑️ Enhanced file deletion with drilling-specific cleanup
+   * Universal file deletion
    */
   async deleteFileFromS3(
     key,
@@ -88,8 +90,7 @@ class EnhancedDrillingDocumentService {
     additionalInfo = {}
   ) {
     try {
-      console.log(`🗑️ Deleting drilling report from S3: ${reason} - ${key}`);
-      console.log(`📊 Additional info:`, additionalInfo);
+      console.log(`🗑️ Deleting document from S3: ${reason} - ${key}`);
 
       const deleteCommand = new DeleteObjectCommand({
         Bucket: this.bucket,
@@ -99,16 +100,11 @@ class EnhancedDrillingDocumentService {
       await s3Client.send(deleteCommand);
       this.metrics.totalDeleted++;
 
-      // Log drilling-specific deletion reasons
-      if (reason.includes("quality")) {
-        this.metrics.errorTypes.qualityCheck++;
-      }
-
-      console.log(`✅ Drilling report deleted from S3: ${key}`);
+      console.log(`✅ Document deleted from S3: ${key}`);
       return true;
     } catch (error) {
       console.error(
-        `❌ Failed to delete drilling report from S3: ${key}`,
+        `❌ Failed to delete document from S3: ${key}`,
         error.message
       );
       return false;
@@ -116,7 +112,7 @@ class EnhancedDrillingDocumentService {
   }
 
   /**
-   * 🎯 Enhanced rate limiting with drilling-specific optimizations
+   * Universal rate limiting
    */
   async checkEmbeddingRateLimit() {
     const now = Date.now();
@@ -132,9 +128,7 @@ class EnhancedDrillingDocumentService {
       const waitTime = EMBEDDING_RATE_LIMIT.windowMs - (now - oldestRequest);
 
       if (waitTime > 0) {
-        console.log(
-          `⏳ Rate limit reached for drilling embeddings, waiting ${waitTime}ms`
-        );
+        console.log(`⏳ Rate limit reached, waiting ${waitTime}ms`);
         await this.delay(waitTime);
       }
     }
@@ -143,57 +137,55 @@ class EnhancedDrillingDocumentService {
   }
 
   /**
-   * 💾 Enhanced caching with drilling-specific optimizations
+   * Universal caching
    */
   getCachedText(key) {
     const cached = this.textCache.get(key);
     if (cached && Date.now() - cached.timestamp < this.CACHE_TTL_MS) {
-      console.log("⚡ Using cached drilling report text");
-      return cached.text;
+      console.log("⚡ Using cached document text");
+      return cached.data;
     }
     this.textCache.delete(key);
     return null;
   }
 
-  setCachedText(key, text, metadata = {}) {
+  setCachedText(key, extractionResult) {
     this.textCache.set(key, {
-      text,
-      metadata,
+      data: extractionResult,
       timestamp: Date.now(),
     });
 
-    // Enhanced cache management
-    if (this.textCache.size > 75) {
-      // Increased cache size
+    if (this.textCache.size > 50) {
       const oldestKey = this.textCache.keys().next().value;
       this.textCache.delete(oldestKey);
     }
   }
 
-  getCachedQuality(textHash) {
-    const cached = this.qualityCache.get(textHash);
+  getCachedChunks(textHash) {
+    const cached = this.chunkCache.get(textHash);
     if (cached && Date.now() - cached.timestamp < this.CACHE_TTL_MS) {
-      console.log("⚡ Using cached quality assessment");
-      return cached.quality;
+      console.log("⚡ Using cached document chunks");
+      return cached.chunks;
     }
-    this.qualityCache.delete(textHash);
+    this.chunkCache.delete(textHash);
     return null;
   }
 
-  setCachedQuality(textHash, quality) {
-    this.qualityCache.set(textHash, {
-      quality,
+  setCachedChunks(textHash, chunks, metadata = {}) {
+    this.chunkCache.set(textHash, {
+      chunks,
+      metadata,
       timestamp: Date.now(),
     });
 
-    if (this.qualityCache.size > 50) {
-      const oldestKey = this.qualityCache.keys().next().value;
-      this.qualityCache.delete(oldestKey);
+    if (this.chunkCache.size > 30) {
+      const oldestKey = this.chunkCache.keys().next().value;
+      this.chunkCache.delete(oldestKey);
     }
   }
 
   /**
-   * 🔧 Enhanced stream to buffer with drilling-specific progress tracking
+   * Universal stream to buffer
    */
   async streamToBuffer(stream, expectedSize = null) {
     return new Promise((resolve, reject) => {
@@ -206,9 +198,8 @@ class EnhancedDrillingDocumentService {
 
         if (expectedSize && receivedSize > 0) {
           const progress = Math.round((receivedSize / expectedSize) * 100);
-          if (progress % 20 === 0) {
-            // More frequent updates for large drilling reports
-            console.log(`📥 Drilling report download progress: ${progress}%`);
+          if (progress % 25 === 0) {
+            console.log(`📥 Document download progress: ${progress}%`);
           }
         }
       });
@@ -217,7 +208,7 @@ class EnhancedDrillingDocumentService {
         try {
           const buffer = Buffer.concat(chunks);
           console.log(
-            `✅ Drilling report stream completed: ${(
+            `✅ Document stream completed: ${(
               buffer.length /
               1024 /
               1024
@@ -236,9 +227,7 @@ class EnhancedDrillingDocumentService {
       const timeout = setTimeout(() => {
         reject(
           new Error(
-            `Drilling report stream timeout after ${
-              STREAM_TIMEOUT_MS / 1000
-            } seconds`
+            `Document stream timeout after ${STREAM_TIMEOUT_MS / 1000} seconds`
           )
         );
       }, STREAM_TIMEOUT_MS);
@@ -249,7 +238,7 @@ class EnhancedDrillingDocumentService {
   }
 
   /**
-   * 📥 Enhanced S3 download with drilling report optimizations
+   * Universal S3 download with better error handling
    */
   async downloadPdfFromS3(key) {
     let lastError;
@@ -257,7 +246,7 @@ class EnhancedDrillingDocumentService {
     for (let attempt = 1; attempt <= MAX_RETRY_ATTEMPTS; attempt++) {
       try {
         console.log(
-          `📥 Downloading drilling report (attempt ${attempt}/${MAX_RETRY_ATTEMPTS}): ${key}`
+          `📥 Downloading document (attempt ${attempt}/${MAX_RETRY_ATTEMPTS}): ${key}`
         );
 
         const command = new GetObjectCommand({
@@ -269,13 +258,13 @@ class EnhancedDrillingDocumentService {
         const data = await s3Client.send(command);
 
         if (!data.Body) {
-          throw new Error("No drilling report data received from S3");
+          throw new Error("No document data received from S3");
         }
 
         const contentLength = data.ContentLength;
         if (contentLength && contentLength > MAX_FILE_SIZE) {
           throw new Error(
-            `Drilling report too large: ${(contentLength / 1024 / 1024).toFixed(
+            `Document too large: ${(contentLength / 1024 / 1024).toFixed(
               2
             )}MB (max: ${MAX_FILE_SIZE / 1024 / 1024}MB)`
           );
@@ -285,11 +274,9 @@ class EnhancedDrillingDocumentService {
         const downloadTime = Date.now() - startTime;
 
         console.log(
-          `✅ Drilling report downloaded: ${(
-            buffer.length /
-            1024 /
-            1024
-          ).toFixed(2)}MB in ${downloadTime}ms`
+          `✅ Document downloaded: ${(buffer.length / 1024 / 1024).toFixed(
+            2
+          )}MB in ${downloadTime}ms`
         );
         return buffer;
       } catch (error) {
@@ -303,7 +290,8 @@ class EnhancedDrillingDocumentService {
         if (
           error.message.includes("too large") ||
           error.message.includes("not found") ||
-          error.message.includes("NoSuchKey")
+          error.message.includes("NoSuchKey") ||
+          error.name === "NoSuchKey"
         ) {
           throw error;
         }
@@ -316,38 +304,25 @@ class EnhancedDrillingDocumentService {
     }
 
     throw new Error(
-      `Failed to download drilling report after ${MAX_RETRY_ATTEMPTS} attempts: ${lastError.message}`
+      `Failed to download document after ${MAX_RETRY_ATTEMPTS} attempts: ${lastError.message}`
     );
   }
 
   /**
-   * 🧠 Enhanced text extraction with drilling report optimization
+   * IMPROVED: Smart text extraction with automatic strategy selection
    */
-  async extractTextFromPdf(pdfBuffer, key) {
-    // Check cache first
-    const cachedText = this.getCachedText(key);
-    if (cachedText) {
-      return cachedText;
+  async extractTextFromPdf(pdfBuffer, key, fileName) {
+    const cachedResult = this.getCachedText(key);
+    if (cachedResult) {
+      return cachedResult;
     }
 
-    console.log(
-      "🔍 Extracting text from drilling report with enhanced methods..."
-    );
+    console.log("🔍 Smart text extraction starting...");
     const startTime = Date.now();
 
     try {
-      // Detect document type from filename
-      const documentType = this.detectDocumentTypeFromFilename(key);
-      console.log(
-        `📋 Detected document type: ${documentType || "auto-detect"}`
-      );
-
-      // Enhanced extraction with drilling optimizations
-      const result = await extractFromPDF(pdfBuffer, {
-        preserveStructure: true,
-        enhanceDrillingTerms: true,
-        documentType: documentType,
-      });
+      // Use the smart auto-extraction that chooses the best strategy
+      const result = await pdfBufferToText(pdfBuffer);
 
       if (
         !result ||
@@ -355,24 +330,24 @@ class EnhancedDrillingDocumentService {
         result.text.trim().length < MIN_TEXT_LENGTH
       ) {
         throw new Error(
-          `Insufficient drilling content extracted: only ${
+          `Insufficient content extracted: only ${
             result?.text?.length || 0
           } characters found (min: ${MIN_TEXT_LENGTH})`
         );
       }
 
-      // Quality assessment for drilling content
-      if (result.qualityScore < DRILLING_QUALITY_THRESHOLD) {
+      // Quality assessment with more flexible thresholds
+      if (result.qualityScore && result.qualityScore < QUALITY_THRESHOLD) {
         console.warn(
-          `⚠️ Low quality drilling content detected (score: ${result.qualityScore.toFixed(
+          `⚠️ Low quality content detected (score: ${result.qualityScore.toFixed(
             2
           )})`
         );
 
-        // Still process but flag as low quality
-        if (result.qualityScore < 0.3) {
+        // Only fail if quality is extremely low
+        if (result.qualityScore < 0.1) {
           throw new Error(
-            `DRILLING_CONTENT_QUALITY_TOO_LOW: Quality score ${result.qualityScore.toFixed(
+            `CONTENT_QUALITY_TOO_LOW: Quality score ${result.qualityScore.toFixed(
               2
             )} below minimum threshold`
           );
@@ -381,238 +356,265 @@ class EnhancedDrillingDocumentService {
 
       const extractionTime = Date.now() - startTime;
       console.log(
-        `✅ Drilling report text extracted: ${
-          result.text.length
-        } characters in ${extractionTime}ms (method: ${
-          result.method
-        }, quality: ${result.qualityScore.toFixed(2)})`
+        `✅ Document text extracted: ${result.text.length} characters in ${extractionTime}ms`
+      );
+      console.log(
+        `📊 Method: ${result.method}, Quality: ${
+          result.qualityScore?.toFixed(2) || "N/A"
+        }`
       );
 
-      // Update drilling-specific metrics
-      this.updateDrillingMetrics(result);
+      // Update extraction method metrics
+      this.updateExtractionMethodMetrics(result.method);
+      this.updateExtractionMetrics(result);
 
-      // Cache the result with metadata
-      this.setCachedText(key, result.text, {
-        method: result.method,
-        qualityScore: result.qualityScore,
-        documentType: result.documentType,
-      });
+      // Cache the complete result
+      this.setCachedText(key, result);
 
-      return result.text;
+      return result;
     } catch (error) {
-      console.error(
-        "❌ Drilling report text extraction failed:",
-        error.message
-      );
+      console.error("❌ Document text extraction failed:", error.message);
       this.metrics.errorTypes.textExtraction++;
 
-      // Enhanced error classification for drilling reports
-      if (error.message.includes("DRILLING_CONTENT_QUALITY_TOO_LOW")) {
+      // Better error classification
+      if (error.message.includes("CONTENT_QUALITY_TOO_LOW")) {
         throw new Error(
-          "DRILLING_QUALITY_INSUFFICIENT: This drilling report has insufficient readable content. Please ensure the PDF contains clear, structured drilling data."
+          "QUALITY_INSUFFICIENT: This document has insufficient readable content for processing."
         );
       }
 
       if (
-        error.message.includes("no extractable text") ||
-        error.message.includes("image-based")
+        error.message.includes("NoSuchKey") ||
+        error.message.includes("not found")
       ) {
         throw new Error(
-          "DRILLING_PDF_IMAGE_BASED: This drilling report appears to be image-based. Please convert it to a text-based PDF with selectable drilling data."
+          "FILE_NOT_FOUND: The specified document could not be found."
         );
       }
 
       if (
-        error.message.includes("corrupted") ||
-        error.message.includes("invalid")
+        error.message.includes("timeout") ||
+        error.message.includes("TIMEOUT")
       ) {
         throw new Error(
-          "DRILLING_PDF_CORRUPTED: Drilling report PDF appears to be corrupted. Please upload a valid drilling report."
+          "EXTRACTION_TIMEOUT: Document processing timed out. Try a smaller file."
         );
       }
 
-      throw new Error(
-        `Drilling report text extraction failed: ${error.message}`
-      );
-    }
-  }
+      if (error.message.includes("OCR") && error.message.includes("failed")) {
+        throw new Error(
+          "OCR_FAILED: Unable to extract text from this image-based PDF. The document may be corrupted or have poor image quality."
+        );
+      }
 
-  // Add these missing methods to your EnhancedDrillingDocumentService class
-
-  /**
-   * 💾 Get cached chunks
-   */
-  getCachedChunks(textHash) {
-    const cached = this.chunkCache.get(textHash);
-    if (cached && Date.now() - cached.timestamp < this.CACHE_TTL_MS) {
-      console.log("⚡ Using cached drilling report chunks");
-      return cached.chunks;
-    }
-    this.chunkCache.delete(textHash);
-    return null;
-  }
-
-  /**
-   * 💾 Set cached chunks
-   */
-  setCachedChunks(textHash, chunks, metadata = {}) {
-    this.chunkCache.set(textHash, {
-      chunks,
-      metadata,
-      timestamp: Date.now(),
-    });
-
-    // Enhanced cache management
-    if (this.chunkCache.size > 50) {
-      const oldestKey = this.chunkCache.keys().next().value;
-      this.chunkCache.delete(oldestKey);
+      throw new Error(`Document text extraction failed: ${error.message}`);
     }
   }
 
   /**
-   * ✂️ Enhanced text chunking with drilling-specific optimizations
+   * IMPROVED: Universal text chunking with better content type detection
    */
-  async chunkTextWithCache(text) {
-    const textHash = this.simpleHash(text.substring(0, 1500)); // Larger sample for drilling content
+  async chunkTextWithCache(text, fileName = "", extractionMethod = "unknown") {
+    const textHash = this.simpleHash(text.substring(0, 1000));
 
     const cachedChunks = this.getCachedChunks(textHash);
     if (cachedChunks) {
       return cachedChunks;
     }
 
-    console.log("✂️ Chunking drilling report text with enhanced algorithm...");
+    console.log("✂️ Chunking document text with universal strategy...");
     const startTime = Date.now();
 
     try {
-      // Enhanced chunking optimized for drilling reports
-      const chunks = await chunkText(text);
+      // Detect content type from filename and text
+      const contentType = this.detectContentType(text, fileName);
+      console.log(`📋 Detected content type: ${contentType}`);
+
+      const chunks = await chunkText(text, {
+        chunkSize: Number(process.env.CHUNK_SIZE || 1350),
+        chunkOverlap: Number(process.env.CHUNK_OVERLAP || 250),
+        contentType: contentType,
+        enhanceChunks: true,
+      });
 
       if (!chunks || chunks.length === 0) {
         throw new Error(
-          "No drilling report chunks generated - content may be too short or invalid"
+          "No chunks generated - content may be too short or invalid"
         );
       }
 
-      // Enhanced chunk validation for drilling content
+      // Universal chunk validation with content-type awareness
       const validChunks = chunks.filter(chunk =>
-        this.validateDrillingChunk(chunk)
+        this.validateChunk(chunk, contentType)
       );
 
       if (validChunks.length === 0) {
-        throw new Error(
-          "All generated chunks are invalid for drilling analysis"
-        );
+        throw new Error("All generated chunks are invalid after validation");
       }
-
-      // Quality assessment for chunks
-      const averageChunkQuality = this.assessChunksQuality(validChunks);
-      console.log(
-        `📊 Average chunk quality for drilling content: ${averageChunkQuality.toFixed(
-          2
-        )}`
-      );
 
       const chunkingTime = Date.now() - startTime;
       console.log(
-        `✅ Generated ${validChunks.length} valid drilling chunks in ${chunkingTime}ms`
+        `✅ Generated ${validChunks.length} valid chunks in ${chunkingTime}ms (${contentType})`
       );
 
-      this.setCachedChunks(textHash, validChunks);
+      this.setCachedChunks(textHash, validChunks, {
+        contentType,
+        extractionMethod,
+        chunkingTime,
+      });
       return validChunks;
     } catch (error) {
-      console.error("❌ Drilling report text chunking failed:", error.message);
+      console.error("❌ Document text chunking failed:", error.message);
       this.metrics.errorTypes.chunking++;
-      throw new Error(`Drilling report text chunking failed: ${error.message}`);
+      throw new Error(`Document text chunking failed: ${error.message}`);
     }
   }
 
   /**
-   * 🚀 Enhanced batch embedding processing for drilling reports - with comprehensive debugging
+   * Detect content type from text and filename
+   */
+  detectContentType(text, fileName = "") {
+    const fileExt = path.extname(fileName).toLowerCase();
+    const fileNameLower = fileName.toLowerCase();
+
+    // Check filename patterns first
+    if (
+      fileNameLower.includes("drill") ||
+      fileNameLower.includes("motor") ||
+      fileNameLower.includes("bha")
+    ) {
+      return "TECHNICAL_DRILLING";
+    }
+    if (
+      fileNameLower.includes("medical") ||
+      fileNameLower.includes("patient") ||
+      fileNameLower.includes("diagnosis")
+    ) {
+      return "MEDICAL";
+    }
+    if (
+      fileNameLower.includes("contract") ||
+      fileNameLower.includes("legal") ||
+      fileNameLower.includes("agreement")
+    ) {
+      return "LEGAL";
+    }
+    if (
+      fileNameLower.includes("financial") ||
+      fileNameLower.includes("report") ||
+      fileNameLower.includes("budget")
+    ) {
+      return "FINANCIAL";
+    }
+
+    // Analyze text content patterns
+    const textSample = text.substring(0, 2000).toLowerCase();
+
+    // Technical/Engineering patterns
+    if (
+      /\b(motor|stator|bit|drilling|wob|rop|rpm|pressure|torque)\b/i.test(
+        textSample
+      )
+    ) {
+      return "TECHNICAL_DRILLING";
+    }
+
+    // Medical patterns
+    if (
+      /\b(patient|diagnosis|treatment|medical|clinical|symptoms|prescription)\b/i.test(
+        textSample
+      )
+    ) {
+      return "MEDICAL";
+    }
+
+    // Legal patterns
+    if (
+      /\b(whereas|hereby|contract|agreement|clause|section|article)\b/i.test(
+        textSample
+      )
+    ) {
+      return "LEGAL";
+    }
+
+    // Financial patterns
+    if (
+      /\b(revenue|profit|financial|budget|investment|quarterly)\b/i.test(
+        textSample
+      )
+    ) {
+      return "FINANCIAL";
+    }
+
+    // Academic patterns
+    if (
+      /\b(abstract|methodology|research|study|analysis|conclusion)\b/i.test(
+        textSample
+      )
+    ) {
+      return "ACADEMIC";
+    }
+
+    // Code patterns
+    if (
+      /\b(function|class|import|const|var|def|public|private)\b/i.test(
+        textSample
+      )
+    ) {
+      return "CODE";
+    }
+
+    return "GENERAL";
+  }
+
+  /**
+   * IMPROVED: Universal batch embedding processing with better error handling
    */
   async processEmbeddingsInBatches(
     chunks,
     collectionName,
     key,
     fileName,
-    userId
+    userId,
+    extractionMetadata = {}
   ) {
     console.log(
-      `🧠 Processing ${chunks.length} drilling report chunks with enhanced embeddings`
+      `🧠 Processing ${chunks.length} document chunks for embeddings`
     );
-
-    // Pre-flight checks
-    console.log("🔍 Pre-flight checks:");
-    console.log("  - Collection name:", collectionName);
-    console.log("  - User ID:", userId);
-    console.log("  - File name:", fileName);
-    console.log("  - Key:", key);
-
-    // Check chunks
-    console.log("📋 Chunk analysis:");
-    chunks.forEach((chunk, i) => {
-      console.log(
-        `  Chunk ${i}: ${chunk.length} chars - "${chunk.substring(0, 50)}..."`
-      );
-    });
 
     const results = [];
     const errors = [];
     const startTime = Date.now();
 
-    // Process one chunk at a time for debugging
+    // Process chunks with progress tracking
     for (let i = 0; i < chunks.length; i++) {
       const chunk = `File/Document name: ${fileName}\nChunk ${i + 1}/${
         chunks.length
       }:\n${chunks[i]}`;
-      console.log(`\n🔍 === Processing chunk ${i + 1}/${chunks.length} ===`);
-      console.log(`Chunk content: "${chunk.substring(0, 200)}..."`);
-      console.log(`Chunk length: ${chunk.length} characters`);
+
+      console.log(`🔍 Processing chunk ${i + 1}/${chunks.length}`);
 
       try {
-        // Test 1: Rate limiting
-        console.log("⏳ Checking rate limit...");
+        // Rate limiting
         await this.checkEmbeddingRateLimit();
-        console.log("✅ Rate limit check passed");
 
-        // Test 2: Embedding generation
-        console.log("🧠 Generating embedding...");
-        console.log("  - Using enhanced drilling context: true");
-        console.log("  - Model: text-embedding-3-small");
-
-        const embeddingStartTime = Date.now();
+        // Generate embedding with retry logic
         const embedding = await this.retryOperation(
           async () => {
-            console.log("  🔄 Calling getEmbedding...");
             const result = await getEmbedding(chunk, {
-              enhanceDrillingContext: true,
               model: "text-embedding-3-small",
             });
-            console.log(
-              `  ✅ getEmbedding returned result with length: ${result?.length}`
-            );
             return result;
           },
           3,
-          `Generate drilling embedding for chunk ${i}`
+          `Generate embedding for chunk ${i + 1}`
         );
 
-        const embeddingTime = Date.now() - embeddingStartTime;
-        console.log(`✅ Embedding generated in ${embeddingTime}ms`);
-        console.log(`   - Embedding length: ${embedding?.length}`);
-        console.log(
-          `   - First few values: [${embedding?.slice(0, 3).join(", ")}...]`
-        );
-
-        // Test 3: Upload to Qdrant
-        console.log("📤 Uploading to Qdrant...");
-        const uploadStartTime = Date.now();
-
+        // Upload to Qdrant with enhanced metadata
         const uploadResult = await this.retryOperation(
           async () => {
             const id = uuidv4();
-            console.log(`  🆔 Generated ID: ${id}`);
 
-            // Simplified payload for debugging
             const payload = {
               key,
               name: fileName,
@@ -621,10 +623,12 @@ class EnhancedDrillingDocumentService {
               totalChunks: chunks.length,
               userId,
               createdAt: new Date().toISOString(),
-              processingVersion: "2.0-drilling-optimized",
+              processingVersion: "universal-v2",
+              extractionMethod: extractionMetadata.method || "unknown",
+              extractionQuality: extractionMetadata.qualityScore || null,
+              contentType: extractionMetadata.contentType || "general",
             };
 
-            console.log("  📦 Payload prepared, calling upsertEmbedding...");
             await upsertEmbedding({
               collectionName,
               points: [
@@ -636,75 +640,55 @@ class EnhancedDrillingDocumentService {
               ],
             });
 
-            console.log("  ✅ upsertEmbedding completed successfully");
             return {
               id,
               content: chunk,
               embedding,
               chunkIndex: i,
+              embeddingDimensions: embedding.length,
             };
           },
           3,
-          `Upload drilling chunk ${i} to Qdrant`
+          `Upload chunk ${i + 1} to Qdrant`
         );
-
-        const uploadTime = Date.now() - uploadStartTime;
-        console.log(`✅ Upload completed in ${uploadTime}ms`);
 
         results.push(uploadResult);
-        console.log(
-          `🎉 Chunk ${i + 1} processed successfully! Total success: ${
-            results.length
-          }`
-        );
+        console.log(`✅ Chunk ${i + 1} processed successfully`);
       } catch (error) {
         console.error(`❌ Chunk ${i + 1} failed:`, error.message);
-        console.error(`❌ Error stack:`, error.stack);
-        console.error(`❌ Chunk that failed: "${chunk.substring(0, 100)}..."`);
-
         this.metrics.errorTypes.embedding++;
         errors.push({
           chunkIndex: i,
           error: error.message,
-          stage: error.message.includes("embedding")
-            ? "embedding"
-            : error.message.includes("upsert")
-            ? "upload"
-            : "unknown",
           chunkPreview: chunk.substring(0, 100),
+          timestamp: new Date().toISOString(),
         });
       }
 
-      // Progress update
+      // Progress update every 20%
       const progressPercent = Math.round(((i + 1) / chunks.length) * 100);
-      console.log(
-        `📊 Progress: ${i + 1}/${
-          chunks.length
-        } (${progressPercent}%) - Success: ${results.length}, Failed: ${
-          errors.length
-        }`
-      );
+      if (progressPercent % 20 === 0) {
+        console.log(
+          `📊 Progress: ${progressPercent}% (${results.length} success, ${errors.length} failed)`
+        );
+      }
+
+      // Small delay to prevent overwhelming the system
+      if (i < chunks.length - 1) {
+        await this.delay(BATCH_PROCESSING_DELAY);
+      }
     }
 
     const totalTime = Date.now() - startTime;
-    console.log(`\n🏁 === Drilling embedding processing complete ===`);
-    console.log(`✅ Successful: ${results.length}`);
-    console.log(`❌ Failed: ${errors.length}`);
-    console.log(`⏱️ Total time: ${totalTime}ms`);
+    console.log(`🏁 Document embedding processing complete`);
     console.log(
-      `📈 Success rate: ${Math.round((results.length / chunks.length) * 100)}%`
+      `✅ Successful: ${results.length}, ❌ Failed: ${errors.length}`
     );
-
-    if (errors.length > 0) {
-      console.warn("\n⚠️ Error summary:");
-      errors.forEach((error, index) => {
-        console.warn(
-          `  ${index + 1}. Chunk ${error.chunkIndex}: ${error.error} (${
-            error.stage
-          })`
-        );
-      });
-    }
+    console.log(
+      `⏱️ Total time: ${totalTime}ms, Avg per chunk: ${Math.round(
+        totalTime / chunks.length
+      )}ms`
+    );
 
     return {
       results,
@@ -712,117 +696,83 @@ class EnhancedDrillingDocumentService {
       successCount: results.length,
       errorCount: errors.length,
       processingTimeMs: totalTime,
-      averageTimePerChunk: totalTime / chunks.length,
-      drillingOptimized: true,
+      averageTimePerChunk: Math.round(totalTime / chunks.length),
+      successRate: (results.length / chunks.length) * 100,
     };
   }
 
   /**
-   * 📊 Update drilling-specific metrics
+   * IMPROVED: Universal chunk validation with content-type awareness
    */
-  updateDrillingMetrics(extractionResult) {
-    if (extractionResult.documentType) {
-      const docType = extractionResult.documentType.toLowerCase();
-      if (docType.includes("bha"))
-        this.metrics.drillingSpecificMetrics.bhaReports++;
-      else if (docType.includes("mmr"))
-        this.metrics.drillingSpecificMetrics.mmrReports++;
-      else if (docType.includes("rven"))
-        this.metrics.drillingSpecificMetrics.rvenReports++;
-    }
-
-    if (extractionResult.qualityScore) {
-      const currentAvg =
-        this.metrics.drillingSpecificMetrics.averageQualityScore;
-      const currentCount = this.metrics.totalProcessed;
-      this.metrics.drillingSpecificMetrics.averageQualityScore =
-        (currentAvg * currentCount + extractionResult.qualityScore) /
-        (currentCount + 1);
-    }
-
-    if (
-      extractionResult.text &&
-      extractionResult.text.includes("STRUCTURED DATA")
-    ) {
-      this.metrics.drillingSpecificMetrics.structuredDataExtractions++;
-    }
-
-    if (
-      extractionResult.method &&
-      (extractionResult.method.includes("ocr") ||
-        extractionResult.method.includes("tesseract"))
-    ) {
-      this.metrics.drillingSpecificMetrics.ocrFallbacks++;
-    }
-  }
-
-  /**
-   * 🔍 Detect document type from filename
-   */
-  detectDocumentTypeFromFilename(filename) {
-    const name = filename.toLowerCase();
-    if (name.includes("bha")) return "BHA";
-    if (name.includes("mmr")) return "MMR";
-    if (name.includes("rven")) return "RVEN";
-    return null;
-  }
-
-  /**
-   * ✅ Validate drilling chunk content
-   */
-  validateDrillingChunk(chunk) {
-    if (!chunk || typeof chunk !== "string" || chunk.trim().length < 30) {
+  validateChunk(chunk, contentType = "GENERAL") {
+    if (!chunk || typeof chunk !== "string" || chunk.trim().length < 20) {
       return false;
     }
 
-    // Check for drilling-relevant content
-    const drillingIndicators = [
-      /\d+\.?\d*\s*(?:klbs|rpm|gpm|psi|usft|degf)/i, // Technical units
-      /motor|bit|bha|stator|drilling|performance|rop|wob/i, // Drilling terms
-      /make|model|grade|vendor|specs|tfa/i, // Equipment terms
-    ];
+    // Remove any enhancement prefixes to check core content
+    const cleanChunk = chunk.replace(/^[A-Z_\s]+:\s*/g, "");
 
-    return drillingIndicators.some(pattern => pattern.test(chunk));
+    // Basic content validation
+    const wordCount = cleanChunk
+      .split(/\s+/)
+      .filter(word => word.length > 2).length;
+    if (wordCount < 5) {
+      return false;
+    }
+
+    // Content-type specific validation
+    const contentIndicators = this.getContentIndicators(contentType);
+    const hasRelevantContent = contentIndicators.some(pattern =>
+      pattern.test(cleanChunk)
+    );
+
+    // General fallback validation
+    if (!hasRelevantContent) {
+      const generalIndicators = [
+        /\w{3,}/g, // Words with 3+ letters
+        /\d+/g, // Numbers
+        /[.!?:;]/g, // Punctuation
+      ];
+      return generalIndicators.some(pattern => pattern.test(cleanChunk));
+    }
+
+    return hasRelevantContent;
   }
 
   /**
-   * 📊 Assess quality of chunks for drilling content
+   * Get content indicators for different content types
    */
-  assessChunksQuality(chunks) {
-    let totalQuality = 0;
+  getContentIndicators(contentType) {
+    const indicators = {
+      TECHNICAL_DRILLING: [
+        /\b(motor|stator|bit|drilling|wob|rop|rpm|pressure|torque|bha)\b/i,
+        /\d+\.?\d*\s*(klbs|rpm|gpm|psi|usft)/i,
+      ],
+      MEDICAL: [
+        /\b(patient|diagnosis|treatment|medical|clinical|symptoms)\b/i,
+        /\d+\s*(mg|ml|dose)/i,
+      ],
+      LEGAL: [
+        /\b(contract|agreement|clause|section|article|whereas)\b/i,
+        /(section|article)\s+\d+/i,
+      ],
+      FINANCIAL: [
+        /\b(revenue|profit|financial|budget|investment)\b/i,
+        /\$[\d,]+|\d+%/i,
+      ],
+      ACADEMIC: [
+        /\b(research|study|analysis|methodology|conclusion)\b/i,
+        /(figure|table)\s+\d+/i,
+      ],
+      CODE: [/\b(function|class|import|const|var|def)\b/i, /[{}();]/],
+      GENERAL: [/\w{3,}/g, /\d+/g, /[.!?:;]/g],
+    };
 
-    chunks.forEach(chunk => {
-      let quality = 0;
-
-      // Technical content indicators
-      if (/\d+\.?\d*\s*(?:klbs|rpm|gpm|psi)/i.test(chunk)) quality += 0.3;
-      if (/motor|stator|bit|bha/i.test(chunk)) quality += 0.3;
-      if (/drilling|performance|rop|wob/i.test(chunk)) quality += 0.2;
-      if (/STRUCTURED DATA|METRICS:/i.test(chunk)) quality += 0.2;
-
-      totalQuality += Math.min(quality, 1.0);
-    });
-
-    return totalQuality / chunks.length;
+    return indicators[contentType] || indicators.GENERAL;
   }
 
   /**
-   * 🏷️ Identify chunk section type for drilling reports
-   */
-  identifyChunkSectionType(chunk) {
-    if (/MOTOR.*STATOR.*SPECIFICATIONS/i.test(chunk))
-      return "motor_stator_specs";
-    if (/BIT.*CONFIGURATION.*SPECS/i.test(chunk)) return "bit_specifications";
-    if (/BHA.*ASSEMBLY.*DETAILS/i.test(chunk)) return "bha_assembly";
-    if (/DRILLING.*PERFORMANCE.*METRICS/i.test(chunk))
-      return "performance_metrics";
-    if (/OPERATIONAL.*DATA/i.test(chunk)) return "operational_data";
-    if (/STRUCTURED DATA/i.test(chunk)) return "structured_summary";
-    return "general_drilling";
-  }
-
-  /**
-   * 🔄 Enhanced retry operation with drilling-specific error handling
+   * Universal retry operation with exponential backoff
    */
   async retryOperation(operation, maxRetries = 3, operationName = "operation") {
     let lastError;
@@ -832,23 +782,24 @@ class EnhancedDrillingDocumentService {
         return await operation();
       } catch (error) {
         lastError = error;
+        console.warn(
+          `⚠️ ${operationName} attempt ${attempt} failed: ${error.message}`
+        );
 
-        if (attempt === 1) {
-          console.warn(`⚠️ ${operationName} failed, retrying...`);
-        }
-
-        // Don't retry certain drilling-specific errors
+        // Don't retry certain errors
         if (
-          error.message?.includes("DRILLING_CONTENT_QUALITY_TOO_LOW") ||
           error.message?.includes("validation") ||
           error.message?.includes("authorization") ||
-          error.message?.includes("not found")
+          error.message?.includes("not found") ||
+          error.message?.includes("too large") ||
+          error.name === "ValidationError"
         ) {
           throw error;
         }
 
         if (attempt < maxRetries) {
           const delay = RETRY_DELAY_MS * Math.pow(2, attempt - 1);
+          console.log(`⏳ Retrying ${operationName} in ${delay}ms...`);
           await this.delay(delay);
         }
       }
@@ -860,20 +811,7 @@ class EnhancedDrillingDocumentService {
   }
 
   /**
-   * 🔢 Enhanced hash function
-   */
-  simpleHash(str) {
-    let hash = 0;
-    for (let i = 0; i < str.length; i++) {
-      const char = str.charCodeAt(i);
-      hash = (hash << 5) - hash + char;
-      hash = hash & hash;
-    }
-    return hash.toString();
-  }
-
-  /**
-   * ✅ Enhanced input validation for drilling reports
+   * Universal input validation with better error messages
    */
   validateInput({ key, collectionName, userId }) {
     const errors = [];
@@ -894,28 +832,25 @@ class EnhancedDrillingDocumentService {
         errors.push("Invalid file path detected");
       }
 
-      // Enhanced validation for drilling report filenames
-      const fileName = path.basename(key).toLowerCase();
-      if (
-        !fileName.includes("bha") &&
-        !fileName.includes("mmr") &&
-        !fileName.includes("rven") &&
-        !fileName.includes("drill")
-      ) {
-        console.warn(
-          `⚠️ Filename '${fileName}' doesn't appear to be a standard drilling report`
-        );
+      if (key.length > 1024) {
+        errors.push("File path too long");
       }
     }
 
     if (!collectionName?.trim()) {
       errors.push("Missing or invalid 'collectionName' parameter");
     } else if (!/^[a-zA-Z0-9_-]+$/.test(collectionName)) {
-      errors.push("Collection name contains invalid characters");
+      errors.push(
+        "Collection name contains invalid characters (only alphanumeric, underscore, and hyphen allowed)"
+      );
+    } else if (collectionName.length > 63) {
+      errors.push("Collection name too long (max 63 characters)");
     }
 
     if (!userId?.trim()) {
       errors.push("Missing or invalid user ID");
+    } else if (userId.length > 256) {
+      errors.push("User ID too long");
     }
 
     if (errors.length > 0) {
@@ -926,126 +861,114 @@ class EnhancedDrillingDocumentService {
   }
 
   /**
-   * 📊 Enhanced performance metrics update
+   * Update extraction method metrics
    */
-  updateMetrics(
-    processingTime,
-    chunksProcessed,
-    textLength,
-    success = true,
-    additionalData = {}
-  ) {
+  updateExtractionMethodMetrics(method) {
+    if (method.includes("digital") && !method.includes("ocr")) {
+      this.metrics.extractionMethods.digitalOnly++;
+      this.metrics.digitalTextSuccess++;
+    } else if (method.includes("ocr") && !method.includes("digital")) {
+      this.metrics.extractionMethods.ocrOnly++;
+      this.metrics.ocrFallbacks++;
+    } else if (method.includes("hybrid")) {
+      this.metrics.extractionMethods.hybrid++;
+      this.metrics.hybridExtractions++;
+    }
+
+    if (method === "auto" || method.includes("auto")) {
+      this.metrics.extractionMethods.autoSelected++;
+    }
+  }
+
+  /**
+   * Update universal metrics
+   */
+  updateMetrics(processingTime, chunksProcessed, textLength, success = true) {
     if (success) {
       this.metrics.totalProcessed++;
       this.metrics.totalChunksProcessed += chunksProcessed;
       this.metrics.totalTextExtracted += textLength;
 
-      const alpha = 0.1;
+      // Update rolling average for processing time
+      const alpha = 0.1; // Smoothing factor
       this.metrics.averageProcessingTime =
         this.metrics.averageProcessingTime * (1 - alpha) +
         processingTime * alpha;
     } else {
       this.metrics.totalErrors++;
     }
+  }
 
-    // Update drilling-specific metrics if provided
-    if (additionalData.documentType) {
-      this.updateDrillingMetrics(additionalData);
+  updateExtractionMetrics(extractionResult) {
+    if (extractionResult.qualityScore) {
+      const currentAvg = this.metrics.averageQualityScore;
+      const currentCount = this.metrics.totalProcessed;
+      this.metrics.averageQualityScore =
+        (currentAvg * currentCount + extractionResult.qualityScore) /
+        (currentCount + 1);
     }
   }
 
   /**
-   * ⏱️ Utility function for delays
+   * Simple hash function for caching
+   */
+  simpleHash(str) {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      const char = str.charCodeAt(i);
+      hash = (hash << 5) - hash + char;
+      hash = hash & hash; // Convert to 32-bit integer
+    }
+    return hash.toString();
+  }
+
+  /**
+   * Utility delay function
    */
   delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
   /**
-   * 🎯 Main enhanced PDF processing method for drilling reports
+   * MAIN IMPROVED PDF PROCESSING METHOD
    */
+  /**
+   * Simplified `processUploadedPdf` with unconditional deletion on failure
+   */
+
   async processUploadedPdf(req, res) {
     const startTime = Date.now();
-    let shouldDeleteFile = false;
-    let deleteReason = "";
-    let drillingMetadata = {};
+    let processingStage = "init";
+    const { key, collectionName } = req.body;
+    const userId = req.user?.UserId;
+    const fileName = path.basename(key);
 
     try {
-      console.log("🚀 === Starting enhanced drilling report processing ===");
-
-      const { key, collectionName } = req.body;
-      const userId = req.user?.UserId;
-
-      // Enhanced validation
       const validation = this.validateInput({ key, collectionName, userId });
       if (!validation.isValid) {
-        shouldDeleteFile = true;
-        deleteReason = "validation_failed";
-
+        await this.deleteFileFromS3(key, "validation_failed");
         return handlers.response.failed({
           res,
-          message: `Drilling report validation failed: ${validation.errors.join(
-            ", "
-          )}`,
+          message: `Validation failed: ${validation.errors.join(", ")}`,
           statusCode: 400,
         });
       }
 
-      const fileName = path.basename(key);
-      const documentType = this.detectDocumentTypeFromFilename(key);
-      console.log(
-        `📄 Processing drilling report: ${fileName} (type: ${
-          documentType || "auto-detect"
-        }) for user: ${userId}`
-      );
+      console.log(`📄 Processing: ${fileName}`);
 
-      // Step 1: Download PDF from S3
-      let pdfBuffer;
-      try {
-        pdfBuffer = await this.downloadPdfFromS3(key);
-      } catch (error) {
-        if (
-          error.message.includes("too large") ||
-          error.message.includes("not found")
-        ) {
-          shouldDeleteFile = true;
-          deleteReason = "s3_download_failed";
-        }
-        throw error;
-      }
+      processingStage = "download";
+      const pdfBuffer = await this.downloadPdfFromS3(key);
 
-      // Step 2: Extract text with enhanced drilling report processing
-      let text;
-      try {
-        text = await this.extractTextFromPdf(pdfBuffer, key);
-        drillingMetadata.extractionMethod = "enhanced";
-        drillingMetadata.documentType =
-          this.detectDocumentTypeFromFilename(key);
-      } catch (error) {
-        shouldDeleteFile = true;
-        deleteReason = "text_extraction_failed";
-        drillingMetadata.extractionError = error.message;
-        throw error;
-      }
+      processingStage = "extract";
+      const text = await pdfBufferToText(pdfBuffer);
 
-      // Step 3: Chunk text with drilling-specific optimizations
-      let chunks;
-      try {
-        chunks = await this.chunkTextWithCache(text);
-        drillingMetadata.chunkCount = chunks.length;
-        drillingMetadata.averageChunkLength = Math.round(
-          text.length / chunks.length
-        );
-      } catch (error) {
-        shouldDeleteFile = true;
-        deleteReason = "text_chunking_failed";
-        throw error;
-      }
+      processingStage = "chunk";
+      const chunks = await chunkText(text, {
+        chunkSize: Number(process.env.CHUNK_SIZE || 1350),
+        chunkOverlap: Number(process.env.CHUNK_OVERLAP || 250),
+      });
 
-      // Step 4: Process embeddings with drilling optimizations
-      console.log(
-        "🧠 Step 4: Processing embeddings with drilling-specific enhancements..."
-      );
+      processingStage = "embedding";
       const embeddingResults = await this.processEmbeddingsInBatches(
         chunks,
         collectionName,
@@ -1054,298 +977,107 @@ class EnhancedDrillingDocumentService {
         userId
       );
 
-      // Enhanced success rate assessment for drilling content
-      const successRate = embeddingResults.successCount / chunks.length;
-      drillingMetadata.embeddingSuccessRate = successRate;
+      processingStage = "save";
+      await saveFileDetails({
+        userId,
+        fileName,
+        key,
+        collectionName,
+        timestamp: new Date().toISOString(),
+        tableName: this.tableName,
+        bucketName: this.bucket,
+        totalChunks: chunks.length,
+        successfulChunks: embeddingResults.successCount,
+        textLength: text.length,
+        processingTimeMs: embeddingResults.processingTimeMs,
+      });
 
-      if (successRate < 0.6) {
-        // Higher threshold for drilling reports
-        shouldDeleteFile = true;
-        deleteReason = "embedding_processing_failed";
-        throw new Error(
-          `Drilling report embedding processing failed: only ${Math.round(
-            successRate * 100
-          )}% of chunks processed successfully (minimum 60% required for drilling analysis)`
-        );
-      }
-
-      // Step 5: Save enhanced file metadata
-      console.log("💾 Step 5: Saving enhanced drilling report metadata...");
-      try {
-        await this.retryOperation(
-          () =>
-            saveFileDetails({
-              userId,
-              fileName,
-              key,
-              collectionName,
-              timestamp: new Date().toISOString(),
-              tableName: this.tableName,
-              bucketName: this.bucket,
-              totalChunks: chunks.length,
-              successfulChunks: embeddingResults.successCount,
-              textLength: text.length,
-              processingTimeMs: embeddingResults.processingTimeMs,
-              // Enhanced drilling-specific metadata
-              documentType: drillingMetadata.documentType,
-              extractionMethod: drillingMetadata.extractionMethod,
-              embeddingSuccessRate: drillingMetadata.embeddingSuccessRate,
-              averageChunkLength: drillingMetadata.averageChunkLength,
-              isDrillingReport: true,
-              processingVersion: "2.0-drilling-optimized",
-            }),
-          2,
-          "Save drilling report metadata"
-        );
-      } catch (error) {
-        shouldDeleteFile = true;
-        deleteReason = "metadata_save_failed";
-        throw error;
-      }
-
-      const totalProcessingTime = Date.now() - startTime;
-
-      // Update enhanced success metrics
-      this.updateMetrics(
-        totalProcessingTime,
-        embeddingResults.successCount,
-        text.length,
-        true,
-        drillingMetadata
-      );
-
-      console.log(
-        `🎉 === Drilling report processing completed in ${totalProcessingTime}ms ===`
-      );
+      const totalTime = Date.now() - startTime;
+      this.updateMetrics(totalTime, embeddingResults.successCount, text.length);
 
       return handlers.response.success({
         res,
-        message: "Drilling report processed and embeddings stored successfully",
+        message: "Processing complete",
         data: {
           fileName,
-          documentType: drillingMetadata.documentType,
           totalChunks: chunks.length,
-          successfulChunks: embeddingResults.successCount,
-          failedChunks: embeddingResults.errorCount,
-          processingTimeMs: totalProcessingTime,
-          embeddingProcessingTimeMs: embeddingResults.processingTimeMs,
-          textLength: text.length,
-          collectionName,
-          successRate: Math.round(
-            (embeddingResults.successCount / chunks.length) * 100
-          ),
-          // Enhanced drilling-specific response data
-          drillingMetadata: {
-            extractionMethod: drillingMetadata.extractionMethod,
-            averageChunkLength: drillingMetadata.averageChunkLength,
-            embeddingSuccessRate: Math.round(
-              drillingMetadata.embeddingSuccessRate * 100
-            ),
-            isDrillingOptimized: true,
-            processingVersion: "2.0-drilling-optimized",
-          },
-          performance: {
-            avgChunkProcessingTime:
-              embeddingResults.processingTimeMs / chunks.length,
-            throughputChunksPerSecond: Math.round(
-              (embeddingResults.successCount /
-                embeddingResults.processingTimeMs) *
-                1000
-            ),
-            drillingOptimized: true,
-          },
-          errors:
-            embeddingResults.errors.length > 0
-              ? embeddingResults.errors.slice(0, 10)
-              : undefined,
+          successCount: embeddingResults.successCount,
+          failedCount: embeddingResults.errorCount,
+          processingTimeMs: totalTime,
         },
       });
     } catch (error) {
-      const totalProcessingTime = Date.now() - startTime;
-
-      // Update error metrics with drilling context
-      this.updateMetrics(totalProcessingTime, 0, 0, false, drillingMetadata);
-
-      console.error(
-        `❌ Drilling report processing failed after ${totalProcessingTime}ms:`,
-        error
-      );
-
-      // Delete file from S3 if processing failed
-      if (shouldDeleteFile && req.body?.key) {
-        console.log(
-          `🗑️ Deleting failed drilling report from S3: ${deleteReason}`
-        );
-        await this.deleteFileFromS3(
-          req.body.key,
-          deleteReason,
-          drillingMetadata
-        );
-      }
-
-      // Enhanced error response with drilling-specific messages
-      let userMessage = error.message;
-      let suggestions = [];
-
-      if (error.message.includes("DRILLING_QUALITY_INSUFFICIENT")) {
-        userMessage =
-          "This drilling report has insufficient readable content for analysis.";
-        suggestions.push(
-          "Ensure the PDF contains clear, structured drilling data"
-        );
-        suggestions.push(
-          "Verify all technical tables and performance metrics are visible"
-        );
-      } else if (error.message.includes("DRILLING_PDF_IMAGE_BASED")) {
-        userMessage =
-          "This drilling report appears to be image-based and cannot be processed.";
-        suggestions.push(
-          "Convert the PDF to text-based format with selectable drilling data"
-        );
-        suggestions.push(
-          "Ensure BHA tables, motor specs, and performance data are text-based"
-        );
-      } else if (error.message.includes("PDF_CORRUPTED")) {
-        userMessage =
-          "The drilling report PDF appears to be corrupted or invalid.";
-        suggestions.push("Try re-saving the drilling report PDF");
-        suggestions.push("Upload a different version of the report");
-      } else if (error.message.includes("embedding_processing_failed")) {
-        userMessage = "Failed to process drilling report data for analysis.";
-        suggestions.push(
-          "Verify the report contains standard drilling terminology"
-        );
-        suggestions.push(
-          "Check that technical data (ROP, WOB, motor specs) is clearly formatted"
-        );
-      }
+      console.error(`❌ Failed at ${processingStage}:`, error.message);
+      await this.deleteFileFromS3(key, `failure_at_${processingStage}`);
 
       return handlers.response.error({
         res,
-        message: `Drilling report processing failed: ${userMessage}`,
-        statusCode: error.statusCode || 500,
-        data: {
-          processingTimeMs: totalProcessingTime,
-          stage: error.stage || deleteReason || "unknown",
-          fileDeleted: shouldDeleteFile,
-          deleteReason,
-          suggestions,
-          errorType: this.classifyDrillingError(error),
-          drillingMetadata,
-          processingVersion: "2.0-drilling-optimized",
-          error:
-            process.env.NODE_ENV === "development" ? error.stack : undefined,
-        },
+        message: `Processing failed at '${processingStage}': ${error.message}`,
+        statusCode: 500,
       });
     }
   }
 
   /**
-   * 🏷️ Enhanced error classification for drilling reports
-   */
-  classifyDrillingError(error) {
-    const message = error.message.toLowerCase();
-
-    if (
-      message.includes("drilling_quality_insufficient") ||
-      message.includes("quality_too_low")
-    ) {
-      return "drilling_content_quality_low";
-    }
-    if (
-      message.includes("drilling_pdf_image_based") ||
-      message.includes("no extractable text")
-    ) {
-      return "drilling_image_based_pdf";
-    }
-    if (message.includes("corrupted") || message.includes("invalid")) {
-      return "drilling_corrupted_pdf";
-    }
-    if (message.includes("too large") || message.includes("size")) {
-      return "drilling_file_too_large";
-    }
-    if (message.includes("embedding") || message.includes("vector")) {
-      return "drilling_embedding_error";
-    }
-    if (message.includes("s3") || message.includes("download")) {
-      return "drilling_s3_error";
-    }
-    if (message.includes("chunk")) {
-      return "drilling_chunking_error";
-    }
-    if (message.includes("validation")) {
-      return "drilling_validation_error";
-    }
-
-    return "drilling_unknown_error";
-  }
-
-  /**
-   * 📊 Enhanced service metrics for drilling reports
+   * Enhanced service metrics with extraction method breakdown
    */
   async getMetrics(req, res) {
     try {
       return handlers.response.success({
         res,
-        message: "Enhanced drilling document service metrics",
+        message: "Universal document service metrics",
         data: {
-          performance: this.metrics,
-          drillingSpecific: {
-            ...this.metrics.drillingSpecificMetrics,
-            documentTypeDistribution: {
-              bhaReports: this.metrics.drillingSpecificMetrics.bhaReports,
-              mmrReports: this.metrics.drillingSpecificMetrics.mmrReports,
-              rvenReports: this.metrics.drillingSpecificMetrics.rvenReports,
-              total:
-                this.metrics.drillingSpecificMetrics.bhaReports +
-                this.metrics.drillingSpecificMetrics.mmrReports +
-                this.metrics.drillingSpecificMetrics.rvenReports,
-            },
-            qualityMetrics: {
-              averageQualityScore:
-                this.metrics.drillingSpecificMetrics.averageQualityScore.toFixed(
-                  3
-                ),
-              structuredDataExtractions:
-                this.metrics.drillingSpecificMetrics.structuredDataExtractions,
-              ocrFallbackRate:
-                this.metrics.totalProcessed > 0
-                  ? (
-                      (this.metrics.drillingSpecificMetrics.ocrFallbacks /
-                        this.metrics.totalProcessed) *
-                      100
-                    ).toFixed(1) + "%"
-                  : "0%",
-            },
-          },
-          cache: {
-            textCacheSize: this.textCache.size,
-            chunkCacheSize: this.chunkCache.size,
-            qualityCacheSize: this.qualityCache.size,
-            estimatedHitRate: this.calculateCacheHitRate(),
-          },
-          system: {
-            uptime: process.uptime(),
-            memoryUsage: process.memoryUsage(),
-            nodeVersion: process.version,
-            optimizedFor: "drilling-reports",
-            version: "2.0-drilling-optimized",
-          },
-          processing: {
+          performance: {
+            totalProcessed: this.metrics.totalProcessed,
+            totalErrors: this.metrics.totalErrors,
             successRate: this.calculateSuccessRate(),
             averageProcessingTime: Math.round(
               this.metrics.averageProcessingTime
             ),
-            totalFilesProcessed: this.metrics.totalProcessed,
-            totalErrors: this.metrics.totalErrors,
-            totalFilesDeleted: this.metrics.totalDeleted,
-            averageChunksPerFile:
+            totalChunksProcessed: this.metrics.totalChunksProcessed,
+            totalTextExtracted: this.metrics.totalTextExtracted,
+            averageQualityScore: this.metrics.averageQualityScore.toFixed(3),
+          },
+          extractionMethods: {
+            digitalTextSuccess: this.metrics.digitalTextSuccess,
+            ocrFallbacks: this.metrics.ocrFallbacks,
+            hybridExtractions: this.metrics.hybridExtractions,
+            methodBreakdown: this.metrics.extractionMethods,
+            digitalSuccessRate:
               this.metrics.totalProcessed > 0
-                ? Math.round(
-                    this.metrics.totalChunksProcessed /
-                      this.metrics.totalProcessed
-                  )
-                : 0,
+                ? `${(
+                    (this.metrics.digitalTextSuccess /
+                      this.metrics.totalProcessed) *
+                    100
+                  ).toFixed(1)}%`
+                : "0%",
+            ocrFallbackRate:
+              this.metrics.totalProcessed > 0
+                ? `${(
+                    (this.metrics.ocrFallbacks / this.metrics.totalProcessed) *
+                    100
+                  ).toFixed(1)}%`
+                : "0%",
+          },
+          cache: {
+            textCacheSize: this.textCache.size,
+            chunkCacheSize: this.chunkCache.size,
+            cacheHitRate: "N/A", // Could implement cache hit tracking
+          },
+          system: {
+            uptime: Math.round(process.uptime()),
+            memoryUsage: {
+              rss: Math.round(process.memoryUsage().rss / 1024 / 1024),
+              heapUsed: Math.round(
+                process.memoryUsage().heapUsed / 1024 / 1024
+              ),
+              heapTotal: Math.round(
+                process.memoryUsage().heapTotal / 1024 / 1024
+              ),
+            },
+            nodeVersion: process.version,
+            serviceType: "universal-document-processor",
+            version: "universal-v2",
           },
           errorBreakdown: this.metrics.errorTypes,
         },
@@ -1353,152 +1085,104 @@ class EnhancedDrillingDocumentService {
     } catch (error) {
       return handlers.response.error({
         res,
-        message: "Failed to get drilling service metrics",
+        message: "Failed to get service metrics",
         statusCode: 500,
       });
     }
   }
 
-  /**
-   * 📈 Calculate enhanced cache hit rate
-   */
-  calculateCacheHitRate() {
-    const totalCacheAttempts = this.metrics.totalProcessed;
-    if (totalCacheAttempts === 0) return 0;
-
-    const estimatedHits = Math.min(
-      this.textCache.size + this.chunkCache.size + this.qualityCache.size,
-      totalCacheAttempts
-    );
-    return Math.round((estimatedHits / totalCacheAttempts) * 100);
-  }
-
-  /**
-   * 📊 Calculate success rate
-   */
   calculateSuccessRate() {
     const total = this.metrics.totalProcessed + this.metrics.totalErrors;
     if (total === 0) return 100;
-
     return Math.round((this.metrics.totalProcessed / total) * 100);
   }
 
   /**
-   * 🧹 Enhanced cache clearing
+   * Clear caches with detailed reporting
    */
   async clearCaches(req, res) {
     try {
       const textCacheSize = this.textCache.size;
       const chunkCacheSize = this.chunkCache.size;
-      const qualityCacheSize = this.qualityCache.size;
 
       this.textCache.clear();
       this.chunkCache.clear();
-      this.qualityCache.clear();
-
-      console.log(
-        `🧹 Drilling service caches cleared: ${textCacheSize} text, ${chunkCacheSize} chunk, ${qualityCacheSize} quality entries`
-      );
 
       return handlers.response.success({
         res,
-        message: "Drilling service caches cleared successfully",
+        message: "Caches cleared successfully",
         data: {
-          timestamp: new Date().toISOString(),
           clearedEntries: {
             textCache: textCacheSize,
             chunkCache: chunkCacheSize,
-            qualityCache: qualityCacheSize,
-            total: textCacheSize + chunkCacheSize + qualityCacheSize,
+            total: textCacheSize + chunkCacheSize,
           },
-          serviceType: "drilling-optimized",
+          timestamp: new Date().toISOString(),
+          memoryFreed: "Cache memory has been released",
         },
       });
     } catch (error) {
       return handlers.response.error({
         res,
-        message: "Failed to clear drilling service caches",
+        message: "Failed to clear caches",
         statusCode: 500,
       });
     }
   }
 
   /**
-   * 🔍 Enhanced health check with drilling-specific status
+   * Enhanced health check
    */
   async healthCheck(req, res) {
     try {
+      const memUsage = process.memoryUsage();
       const health = {
         status: "healthy",
         timestamp: new Date().toISOString(),
-        uptime: process.uptime(),
+        uptime: Math.round(process.uptime()),
         version: process.version,
-        environment: process.env.NODE_ENV || "development",
-        serviceType: "drilling-document-processor",
-        optimizationVersion: "2.0-drilling-optimized",
-        services: {
-          s3: "unknown",
-          dynamodb: "unknown",
-          qdrant: "unknown",
-        },
+        serviceType: "universal-document-processor",
+        serviceVersion: "universal-v2",
         metrics: {
           processedFiles: this.metrics.totalProcessed,
           errors: this.metrics.totalErrors,
           successRate: this.calculateSuccessRate(),
-          cacheSize:
-            this.textCache.size + this.chunkCache.size + this.qualityCache.size,
+          cacheSize: this.textCache.size + this.chunkCache.size,
         },
-        drillingMetrics: {
-          bhaReports: this.metrics.drillingSpecificMetrics.bhaReports,
-          mmrReports: this.metrics.drillingSpecificMetrics.mmrReports,
-          rvenReports: this.metrics.drillingSpecificMetrics.rvenReports,
-          averageQuality:
-            this.metrics.drillingSpecificMetrics.averageQualityScore.toFixed(3),
-          structuredExtractions:
-            this.metrics.drillingSpecificMetrics.structuredDataExtractions,
+        system: {
+          memoryUsageMB: Math.round(memUsage.rss / 1024 / 1024),
+          heapUsedMB: Math.round(memUsage.heapUsed / 1024 / 1024),
+          cpuUsage: process.cpuUsage(),
+        },
+        extractionCapabilities: {
+          digitalText: "enabled",
+          ocrFallback: "enabled",
+          hybridExtraction: "enabled",
+          autoStrategy: "enabled",
         },
       };
 
-      // Quick S3 connectivity check
-      try {
-        await s3Client.send(
-          new GetObjectCommand({
-            Bucket: this.bucket,
-            Key: "health-check-dummy-key",
-          })
-        );
-        health.services.s3 = "healthy";
-      } catch (error) {
-        if (error.name === "NoSuchKey") {
-          health.services.s3 = "healthy";
-        } else {
-          health.services.s3 = "error";
-          health.status = "degraded";
-        }
-      }
-
       return handlers.response.success({
         res,
-        message: "Drilling service health check completed",
+        message: "Health check completed",
         data: health,
       });
     } catch (error) {
       return handlers.response.error({
         res,
-        message: "Drilling service health check failed",
+        message: "Health check failed",
         statusCode: 503,
         data: {
           status: "unhealthy",
           error: error.message,
           timestamp: new Date().toISOString(),
-          serviceType: "drilling-document-processor",
         },
       });
     }
   }
 
   /**
-   * 📋 Enhanced processing statistics for drilling reports
+   * Enhanced processing statistics
    */
   async getProcessingStats(req, res) {
     try {
@@ -1509,35 +1193,7 @@ class EnhancedDrillingDocumentService {
           totalDeleted: this.metrics.totalDeleted,
           successRate: this.calculateSuccessRate(),
           averageProcessingTime: Math.round(this.metrics.averageProcessingTime),
-          serviceType: "drilling-optimized",
-        },
-        drillingSpecific: {
-          documentTypes: {
-            bhaReports: this.metrics.drillingSpecificMetrics.bhaReports,
-            mmrReports: this.metrics.drillingSpecificMetrics.mmrReports,
-            rvenReports: this.metrics.drillingSpecificMetrics.rvenReports,
-            totalDrillingReports:
-              this.metrics.drillingSpecificMetrics.bhaReports +
-              this.metrics.drillingSpecificMetrics.mmrReports +
-              this.metrics.drillingSpecificMetrics.rvenReports,
-          },
-          qualityMetrics: {
-            averageQualityScore:
-              this.metrics.drillingSpecificMetrics.averageQualityScore.toFixed(
-                3
-              ),
-            structuredDataExtractions:
-              this.metrics.drillingSpecificMetrics.structuredDataExtractions,
-            ocrFallbacks: this.metrics.drillingSpecificMetrics.ocrFallbacks,
-            ocrFallbackRate:
-              this.metrics.totalProcessed > 0
-                ? `${(
-                    (this.metrics.drillingSpecificMetrics.ocrFallbacks /
-                      this.metrics.totalProcessed) *
-                    100
-                  ).toFixed(1)}%`
-                : "0%",
-          },
+          serviceType: "universal-v2",
         },
         performance: {
           totalChunksProcessed: this.metrics.totalChunksProcessed,
@@ -1555,35 +1211,57 @@ class EnhancedDrillingDocumentService {
                   this.metrics.totalTextExtracted / this.metrics.totalProcessed
                 )
               : 0,
+          averageQualityScore: this.metrics.averageQualityScore.toFixed(3),
+        },
+        extractionAnalysis: {
+          digitalOnlySuccess: this.metrics.extractionMethods.digitalOnly,
+          ocrOnlyUsed: this.metrics.extractionMethods.ocrOnly,
+          hybridExtractions: this.metrics.extractionMethods.hybrid,
+          autoStrategyUsed: this.metrics.extractionMethods.autoSelected,
+          digitalSuccessRate:
+            this.metrics.totalProcessed > 0
+              ? `${(
+                  (this.metrics.digitalTextSuccess /
+                    this.metrics.totalProcessed) *
+                  100
+                ).toFixed(1)}%`
+              : "0%",
+          ocrFallbackRate:
+            this.metrics.totalProcessed > 0
+              ? `${(
+                  (this.metrics.ocrFallbacks / this.metrics.totalProcessed) *
+                  100
+                ).toFixed(1)}%`
+              : "0%",
         },
         errorBreakdown: this.metrics.errorTypes,
         cache: {
           textCacheEntries: this.textCache.size,
           chunkCacheEntries: this.chunkCache.size,
-          qualityCacheEntries: this.qualityCache.size,
-          estimatedHitRate: this.calculateCacheHitRate(),
+          totalCacheEntries: this.textCache.size + this.chunkCache.size,
         },
         system: {
           uptime: Math.round(process.uptime()),
           memoryUsageMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
           nodeVersion: process.version,
-          optimizationVersion: "2.0-drilling-optimized",
+          version: "universal-v2",
+          lastUpdated: new Date().toISOString(),
         },
       };
 
       return handlers.response.success({
         res,
-        message: "Drilling service processing statistics retrieved",
+        message: "Processing statistics retrieved",
         data: stats,
       });
     } catch (error) {
       return handlers.response.error({
         res,
-        message: "Failed to get drilling service processing statistics",
+        message: "Failed to get processing statistics",
         statusCode: 500,
       });
     }
   }
 }
 
-module.exports = new EnhancedDrillingDocumentService();
+module.exports = new ProcessingService();

@@ -18,14 +18,6 @@ class Controllers {
   async count(req, res) {
     return await this.service.getUserChatCount(req, res);
   }
-
-  async getMetrics(req, res) {
-    return await this.service.getMetrics(req, res);
-  }
-
-  async clearCache(req, res) {
-    return await this.service.clearCache(req, res);
-  }
 }
 
 module.exports = new Controllers();

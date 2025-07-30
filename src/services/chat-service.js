@@ -6,894 +6,241 @@ const { saveQuery } = require("../utilities/save-query");
 const searchResults = require("../utilities/search-results");
 const { QueryCommand, BatchWriteCommand } = require("@aws-sdk/lib-dynamodb");
 
-class EnhancedDrillingSearchService {
+class ChatService {
   constructor() {
-    this.bucket = process.env.BUCKET_NAME;
     this.tableName = process.env.DYNAMODB_TABLE_NAME;
-
-    // Enhanced caching with drilling-specific optimizations
-    this.embeddingCache = new Map();
-    this.responseCache = new Map();
-    this.drillingQueryCache = new Map(); // Specialized cache for drilling queries
-
-    // Enhanced cache settings
-    this.CACHE_TTL_MS = 10 * 60 * 1000; // Extended to 10 minutes for technical queries
-    this.DRILLING_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes for drilling analysis
-    this.MAX_CACHE_SIZE = 200; // Increased cache size
-    this.MAX_DRILLING_CACHE_SIZE = 100;
-
-    // Enhanced metrics tracking
-    this.metrics = {
-      totalRequests: 0,
-      cacheHits: 0,
-      averageResponseTime: 0,
-      drillingQueries: 0,
-      aggregationQueries: 0,
-      technicalTermsProcessed: 0,
-      embeddingEnhancements: 0,
-    };
-
-    // Cleanup intervals
-    setInterval(() => this.cleanupCache(), 15 * 60 * 1000); // Every 15 minutes
-
-    console.log("🚀 Enhanced Drilling Search Service initialized");
+    console.log("🚀 RAG Service initialized");
   }
 
-  /**
-   * Enhanced embedding caching with drilling context
-   */
-  getCachedEmbedding(query) {
-    const key = this.normalizeQueryKey(query);
-    const cached = this.embeddingCache.get(key);
-    if (cached && Date.now() - cached.timestamp < this.CACHE_TTL_MS) {
-      return cached.embedding;
-    }
-    this.embeddingCache.delete(key);
-    return null;
-  }
-
-  setCachedEmbedding(query, embedding) {
-    const key = this.normalizeQueryKey(query);
-    if (this.embeddingCache.size >= this.MAX_CACHE_SIZE) {
-      const oldestKey = this.embeddingCache.keys().next().value;
-      this.embeddingCache.delete(oldestKey);
-    }
-    this.embeddingCache.set(key, {
-      embedding,
-      timestamp: Date.now(),
-      queryType: this.classifyQuery(query),
-    });
-  }
-
-  /**
-   * Enhanced response caching with drilling-specific TTL
-   */
-  getCachedResponse(query, userId) {
-    const key = `${userId}_${this.normalizeQueryKey(query)}`;
-    const cached = this.responseCache.get(key);
-
-    // Use longer TTL for drilling analysis queries
-    const ttl = this.isDrillingQuery(query)
-      ? this.DRILLING_CACHE_TTL_MS
-      : this.CACHE_TTL_MS;
-
-    if (cached && Date.now() - cached.timestamp < ttl) {
-      this.metrics.cacheHits++;
-      return {
-        ...cached.response,
-        metrics: { ...cached.response.metrics, cached: true },
-      };
-    }
-    this.responseCache.delete(key);
-    return null;
-  }
-
-  setCachedResponse(query, userId, response) {
-    const key = `${userId}_${this.normalizeQueryKey(query)}`;
-    if (this.responseCache.size >= this.MAX_CACHE_SIZE) {
-      const oldestKey = this.responseCache.keys().next().value;
-      this.responseCache.delete(oldestKey);
-    }
-    this.responseCache.set(key, {
-      response,
-      timestamp: Date.now(),
-      queryType: this.classifyQuery(query),
-    });
-  }
-
-  /**
-   * Specialized drilling query caching for aggregation results
-   */
-  getCachedDrillingAnalysis(query, userId) {
-    const key = `${userId}_${this.normalizeQueryKey(query)}`;
-    const cached = this.drillingQueryCache.get(key);
-    if (cached && Date.now() - cached.timestamp < this.DRILLING_CACHE_TTL_MS) {
-      return cached.analysis;
-    }
-    this.drillingQueryCache.delete(key);
-    return null;
-  }
-
-  setCachedDrillingAnalysis(query, userId, analysis) {
-    const key = `${userId}_${this.normalizeQueryKey(query)}`;
-    if (this.drillingQueryCache.size >= this.MAX_DRILLING_CACHE_SIZE) {
-      const oldestKey = this.drillingQueryCache.keys().next().value;
-      this.drillingQueryCache.delete(oldestKey);
-    }
-    this.drillingQueryCache.set(key, {
-      analysis,
-      timestamp: Date.now(),
-      queryComplexity: this.assessQueryComplexity(query),
-    });
-  }
-
-  /**
-   * Enhanced cache cleanup with drilling optimizations
-   */
-  cleanupCache() {
-    const now = Date.now();
-
-    // Clean embedding cache
-    for (const [key, value] of this.embeddingCache.entries()) {
-      if (now - value.timestamp > this.CACHE_TTL_MS) {
-        this.embeddingCache.delete(key);
-      }
-    }
-
-    // Clean response cache with different TTLs
-    for (const [key, value] of this.responseCache.entries()) {
-      const ttl =
-        value.queryType === "drilling"
-          ? this.DRILLING_CACHE_TTL_MS
-          : this.CACHE_TTL_MS;
-      if (now - value.timestamp > ttl) {
-        this.responseCache.delete(key);
-      }
-    }
-
-    // Clean drilling analysis cache
-    for (const [key, value] of this.drillingQueryCache.entries()) {
-      if (now - value.timestamp > this.DRILLING_CACHE_TTL_MS) {
-        this.drillingQueryCache.delete(key);
-      }
-    }
-
-    console.log(
-      `🧹 Cache cleanup completed: ${this.embeddingCache.size} embeddings, ${this.responseCache.size} responses, ${this.drillingQueryCache.size} drilling analyses`
-    );
-  }
-
-  /**
-   * Enhanced metrics tracking
-   */
-  updateMetrics(responseTime, cached = false, queryType = "general") {
-    this.metrics.totalRequests++;
-
-    if (queryType === "drilling") this.metrics.drillingQueries++;
-    if (queryType === "aggregation") this.metrics.aggregationQueries++;
-
-    const alpha = 0.1;
-    this.metrics.averageResponseTime =
-      this.metrics.averageResponseTime * (1 - alpha) + responseTime * alpha;
-  }
-
-  /**
-   * Enhanced retry operation with drilling-specific error handling
-   */
-  async retryOperation(operation, maxRetries = 2, name = "operation") {
-    let lastError;
-    for (let i = 1; i <= maxRetries; i++) {
-      try {
-        return await operation();
-      } catch (error) {
-        lastError = error;
-
-        // Don't retry certain drilling-specific errors
-        if (
-          [
-            "validation",
-            "authorization",
-            "rate limit",
-            "drilling_content_insufficient",
-          ].some(msg => error.message.toLowerCase().includes(msg))
-        ) {
-          throw error;
-        }
-
-        if (i < maxRetries) {
-          const delay = 1000 * i * (name.includes("drilling") ? 1.5 : 1); // Longer delay for drilling operations
-          await new Promise(r => setTimeout(r, delay));
-        }
-      }
-    }
-    throw new Error(
-      `${name} failed after ${maxRetries} attempts: ${lastError.message}`
-    );
-  }
-
-  /**
-   * Enhanced search with drilling optimizations
-   */
   async search(req, res) {
     const startTime = Date.now();
     const { query, collectionName = "document_embeddings" } = req.body;
     const userId = req.user?.UserId;
 
-    if (!query) {
+    if (!query?.trim()) {
       return handlers.response.failed({ res, message: "Query is required" });
     }
 
     const sanitizedQuery = query.trim();
-    const queryType = this.classifyQuery(sanitizedQuery);
-    const isDrilling = this.isDrillingQuery(sanitizedQuery);
+    console.log(`🔍 Processing: "${sanitizedQuery}"`);
 
-    console.log(
-      `🔍 Processing ${queryType} query: "${sanitizedQuery.substring(
-        0,
-        100
-      )}..."`
-    );
-
-    // Check for cached response
-    const cachedResponse = this.getCachedResponse(sanitizedQuery, userId);
-    if (cachedResponse) {
-      this.updateMetrics(Date.now() - startTime, true, queryType);
-      return handlers.response.success({
-        res,
-        message: "Answer from cache",
-        data: cachedResponse,
+    try {
+      // 1. Get embedding
+      console.log(`🧠 Getting embedding...`);
+      const embedding = await getEmbedding(sanitizedQuery, {
+        model: "text-embedding-3-small",
       });
-    }
 
-    // Check for cached drilling analysis for complex queries
-    if (isDrilling && queryType === "aggregation") {
-      const cachedAnalysis = this.getCachedDrillingAnalysis(
-        sanitizedQuery,
-        userId
-      );
-      if (cachedAnalysis) {
-        this.updateMetrics(Date.now() - startTime, true, "drilling");
+      if (!embedding) {
+        throw new Error("Failed to generate embedding");
+      }
+
+      // 2. Search documents
+      const results = await searchResults({
+        collectionName,
+        embedding,
+        queryText: sanitizedQuery,
+        limit: 20,
+        scoreThreshold: 0.3,
+      });
+
+      console.log(`📊 Found ${results.length} results`);
+
+      if (results.length === 0) {
         return handlers.response.success({
           res,
-          message: "Drilling analysis from cache",
-          data: cachedAnalysis,
+          message: "No relevant information found",
+          data: {
+            answer:
+              "I couldn't find relevant information to answer your question.",
+            sources: [],
+            metrics: { resultsCount: 0 },
+          },
         });
       }
-    }
 
-    // Generate or retrieve embedding
-    let embedding = this.getCachedEmbedding(sanitizedQuery);
-    let embeddingFromCache = true;
+      // 3. Build context
+      const context = this.buildContext(results);
 
-    if (!embedding) {
-      console.log(`🧠 Generating enhanced embedding for ${queryType} query...`);
+      // 4. Generate response
+      console.log(`🤖 Generating response...`);
+      const completion = await openaiClient.chat.completions.create({
+        model: "gpt-4o",
+        temperature: 0.3,
+        messages: [
+          {
+            role: "system",
+            content: `You are a specialized assistant trained to extract and answer technical questions from motor reports and directional drilling documents. These reports may contain structured tables, text blocks, scanned images, or OCR outputs.
 
-      embedding = await this.retryOperation(
-        () =>
-          getEmbedding(sanitizedQuery, {
-            enhanceDrillingContext: isDrilling,
-            model: "text-embedding-3-small",
-          }),
-        2,
-        `Generate ${isDrilling ? "Drilling" : "Standard"} Embedding`
-      );
+INSTRUCTIONS:
 
-      this.setCachedEmbedding(sanitizedQuery, embedding);
-      embeddingFromCache = false;
+- Always base your answers on the content of the uploaded documents, no assumptions.
+- Your primary goal is to **accurately extract numeric and technical data** from the reports.
+- Include values with proper **units** where available.
+- **If the answer is not found**, respond with “Not specified in the documents.”
+- Use the most relevant and complete source when answering.
+- Mention the **document name** where the answer was found.
 
-      if (isDrilling) this.metrics.embeddingEnhancements++;
-    }
+RECOGNIZED METRICS TO EXTRACT (when asked):
+- Footage drilled (Total / Slide / Rotary)
+- Average WOB (Weight on Bit)
+- Average ROP (Rate of Penetration)
+- Slide percentage (based on footage)
+- Circulation hours
+- Bit hours
+- Hole size (e.g., 6.75", 8", 9.875", 12.25")
+- Motor configuration (make, model, size, torque, max diff)
+- Bit make/model and performance
+- Date In / Out
+- RPM, Flow Rate, SPP, Torque
+- Section type (Vertical, Curve, Lateral, Intermediate)
 
-    // Enhanced search with drilling optimizations
-    const searchOptions = this.getSearchOptions(queryType, isDrilling);
+EXAMPLES:
 
-    const results = await this.retryOperation(
-      () =>
-        searchResults({
-          collectionName,
-          embedding,
-          ...searchOptions,
-        }),
-      2,
-      `${isDrilling ? "Drilling" : "Standard"} Vector Search`
-    );
+Q: "What are the circ hours in Motor Report Run 1, BHA 1?"
+A: In "TAK 700-R-005 BHA#1 Motor Report.pdf", Run 1, BHA 1 lists:
+- Circulation Hours: **46.62 hrs**
 
-    console.log(
-      `📊 Found ${results.length} relevant results for ${queryType} query`
-    );
+Q: "Which bit model had the highest ROP in 9.875\" section?"
+A: In "MMR_BHA #2_Intermediate_Legacy 2632A-C3 5H_RVEN 70033.pdf":
+- Bit Model: **XYZ123**
+- Hole Size: **9.875"**
+- ROP: **215 ft/hr**
 
-    // Process results with drilling-specific context
-    const context = this.buildEnhancedContext(results, queryType, isDrilling);
-    const sources = this.formatSources(results);
+Q: "What motor had the highest torque in 8\" hole sections?"
+A: In "Tak 500-R-007 BHA #6 Motor Report.pdf":
+- Motor: **IBEX**
+- Size: **8"**
+- Max Torque: **22,530 ft-lbs**
 
-    // Enhanced OpenAI completion with drilling-specific prompts
-    const model = "gpt-4-turbo";
-    const temperature = isDrilling ? 0.1 : 0.3; // Lower temperature for technical drilling queries
+FORMAT:
+Always list the document name and clearly formatted data fields in your answer.
+If multiple documents contribute to an answer, mention each one separately.
 
-    const systemPrompt = this.getSystemPrompt(queryType, isDrilling);
-    const userPrompt = this.buildUserPrompt(context, sanitizedQuery, queryType);
-
-    console.log(
-      `🤖 Generating ${
-        isDrilling ? "drilling-optimized" : "standard"
-      } response...`
-    );
-
-    const completion = await this.retryOperation(
-      () =>
-        openaiClient.chat.completions.create({
-          model,
-          temperature,
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: userPrompt },
-          ],
-        }),
-      2,
-      "OpenAI API Call"
-    );
-
-    const content = completion.choices[0].message.content;
-    const totalRequestTimeMs = Date.now() - startTime;
-
-    // Build enhanced response data
-    const responseData = {
-      answer: content,
-      sources,
-      queryType,
-      isDrillingOptimized: isDrilling,
-      metrics: {
-        totalRequestTimeMs,
-        cached: false,
-        embeddingFromCache,
-        resultsCount: results.length,
-        tokensUsed: completion.usage?.total_tokens || 0,
-        processingVersion: "2.0-drilling-optimized",
-        queryComplexity: this.assessQueryComplexity(sanitizedQuery),
-        technicalTermsFound: this.countTechnicalTerms(sanitizedQuery),
-      },
-    };
-
-    // Track technical terms
-    this.metrics.technicalTermsProcessed +=
-      responseData.metrics.technicalTermsFound;
-
-    // Save query with enhanced metadata
-    await this.retryOperation(
-      () =>
-        saveQuery({
-          userId,
-          queryText: sanitizedQuery,
-          answer: content,
-          model,
-          temperature,
-          totalTokens: completion.usage?.total_tokens || null,
-          timestamp: new Date().toISOString(),
-          sources,
-          metrics: responseData.metrics,
-          tableName: this.tableName,
-          metadata: {
-            queryType,
-            isDrillingQuery: isDrilling,
-            processingVersion: "2.0-drilling-optimized",
-            technicalTermsCount: responseData.metrics.technicalTermsFound,
+TASK:
+Based on the uploaded documents, answer the user's technical drilling question below.
+`,
           },
-        }),
-      2,
-      "Save Enhanced Query"
-    );
+          {
+            role: "user",
+            content: `Documents:
+${context}
 
-    // Cache the response
-    this.setCachedResponse(sanitizedQuery, userId, responseData);
+Question: ${sanitizedQuery}
 
-    // Cache drilling analysis for aggregation queries
-    if (isDrilling && queryType === "aggregation") {
-      this.setCachedDrillingAnalysis(sanitizedQuery, userId, responseData);
+Please answer based on the documents above.`,
+          },
+        ],
+      });
+
+      const answer = completion.choices[0].message.content;
+      const totalTime = Date.now() - startTime;
+
+      // 5. Prepare response
+      const responseData = {
+        answer,
+        sources: this.formatSources(results),
+        metrics: {
+          totalRequestTimeMs: totalTime,
+          resultsCount: results.length,
+          tokensUsed: completion.usage?.total_tokens || 0,
+        },
+      };
+
+      // 6. Save query
+      await saveQuery({
+        userId,
+        queryText: sanitizedQuery,
+        answer,
+        model: "gpt-4-turbo",
+        temperature: 0.1,
+        totalTokens: completion.usage?.total_tokens || null,
+        timestamp: new Date().toISOString(),
+        sources: responseData.sources,
+        metrics: responseData.metrics,
+        tableName: this.tableName,
+      });
+
+      return handlers.response.success({
+        res,
+        message: "Answer generated successfully",
+        data: responseData,
+      });
+    } catch (error) {
+      console.error("❌ Search failed:", error);
+      return handlers.response.error({
+        res,
+        message: "Search failed: " + error.message,
+        statusCode: 500,
+      });
     }
+  }
 
-    this.updateMetrics(totalRequestTimeMs, false, queryType);
+  buildContext(results) {
+    return results
+      .slice(0, 15) // Limit context
+      .map((r, index) => {
+        const filename = r.payload?.name || `Document ${index + 1}`;
+        return `=== ${filename} ===\n${r.payload?.content || ""}`;
+      })
+      .join("\n\n");
+  }
 
-    return handlers.response.success({
-      res,
-      message: `Answer from ${
-        isDrilling ? "drilling-optimized" : "standard"
-      } GPT`,
-      data: responseData,
-    });
+  formatSources(results) {
+    return results.slice(0, 5).map((r, idx) => ({
+      FileName: r.payload?.name || `Document ${idx + 1}`,
+      Score: (r.score || 0).toFixed(3),
+      Rank: idx + 1,
+    }));
   }
 
   async chats(req, res) {
     try {
       const userId = req.user?.UserId;
-      const { limit = 10, lastKey, filterByType } = req.query;
+      const { limit = 10 } = req.query;
 
       if (!userId) {
         return handlers.response.failed({ res, message: "Missing userId" });
       }
 
-      console.log(
-        `Fetching chats for user: ${userId}, filterByType: ${filterByType}`
-      );
-
-      // Strategy: Use higher limit to overcome filter limitations
       const params = {
         TableName: this.tableName,
         IndexName: "UserIdIndex",
         KeyConditionExpression: "UserId = :userId",
-        ExpressionAttributeValues: {
-          ":userId": userId,
-        },
-        Limit: Math.max(Number(limit) * 10, 50), // Much higher limit to find filtered items
-        ScanIndexForward: false, // Newest first
+        ExpressionAttributeValues: { ":userId": userId },
+        Limit: Number(limit) * 2, // Get extra to filter
+        ScanIndexForward: false,
       };
 
-      // Only add filter if we're specifically looking for drilling queries
-      // Skip EntityType filter since it might be causing issues
-      if (filterByType === "drilling") {
-        params.FilterExpression = "isDrillingQuery = :isDrilling";
-        params.ExpressionAttributeValues[":isDrilling"] = true;
-      }
-
-      if (lastKey) {
-        try {
-          params.ExclusiveStartKey = JSON.parse(lastKey);
-        } catch {
-          return handlers.response.failed({
-            res,
-            message: "Invalid pagination token",
-          });
-        }
-      }
-
-      console.log("Query params:", JSON.stringify(params, null, 2));
-
       const result = await docClient.send(new QueryCommand(params));
-      console.log(`Found ${result.Items?.length || 0} total items`);
 
-      // Filter in application code instead of database
       const chats = (result.Items || [])
-        .filter(item => {
-          // Filter for Chat EntityType and content
-          const isChat = item.EntityType === "Chat";
-          const hasContent = !!(item.Query || item.Answer);
-
-          console.log(
-            `Item check - EntityType: "${item.EntityType}", isChat: ${isChat}, hasContent: ${hasContent}`
-          );
-
-          return isChat && hasContent;
-        })
+        .filter(item => item.EntityType === "Chat" && item.Query)
         .map(item => ({
           id: item.QueryId,
           query: item.Query || "",
           answer: item.Answer || "",
-          sources: item.sources || [],
-          metrics: item.metrics || {},
           timestamp: item.CreatedAt || item.UpdatedAt,
-          queryType: item.queryType || item.QueryType || "general",
-          isDrillingQuery:
-            item.isDrillingQuery || item.IsDrillingQuery || false,
-          technicalTermsCount:
-            item.technicalTermsCount || item.TechnicalTermsCount || 0,
-          model: item.Model,
-          temperature: item.Temperature,
-          totalTokens: item.TotalTokens,
-          complexityScore: item.complexityScore || item.ComplexityScore,
-          processingVersion: item.processingVersion || item.ProcessingVersion,
+          sources: item.sources || [],
         }))
         .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
-        .slice(0, Number(limit)); // Apply final limit
-
-      console.log(`Returning ${chats.length} chats after filtering`);
-
-      const analytics = this.analyzeChatHistory(chats);
+        .slice(0, Number(limit));
 
       return handlers.response.success({
         res,
-        message: "User chats fetched successfully",
-        data: {
-          chats,
-          nextPageToken: result.LastEvaluatedKey
-            ? JSON.stringify(result.LastEvaluatedKey)
-            : null,
-          metadata: {
-            count: chats.length,
-            hasMore: !!result.LastEvaluatedKey,
-            rawItemsFound: result.Items?.length || 0,
-            filterApplied: filterByType || "none",
-          },
-          analytics,
-        },
+        message: "Chats fetched successfully",
+        data: { chats, count: chats.length },
       });
     } catch (error) {
-      console.error("Chats fetch error:", error);
+      console.error("❌ Chats fetch error:", error);
       return handlers.response.error({
         res,
-        message: error.message || "Failed to fetch chats",
-        statusCode: 500,
-      });
-    }
-  }
-  /**
-   * Enhanced metrics with drilling-specific insights
-   */
-  async getMetrics(req, res) {
-    try {
-      const cacheHitRate =
-        this.metrics.totalRequests > 0
-          ? this.metrics.cacheHits / this.metrics.totalRequests
-          : 0;
-
-      const drillingQueryRate =
-        this.metrics.totalRequests > 0
-          ? this.metrics.drillingQueries / this.metrics.totalRequests
-          : 0;
-
-      const metricsData = {
-        performance: {
-          totalRequests: this.metrics.totalRequests,
-          cacheHitRate: Math.round(cacheHitRate * 100) / 100,
-          averageResponseTime: Math.round(this.metrics.averageResponseTime),
-          serviceOptimized: "drilling-reports",
-        },
-        drillingSpecific: {
-          drillingQueries: this.metrics.drillingQueries,
-          aggregationQueries: this.metrics.aggregationQueries,
-          drillingQueryRate: Math.round(drillingQueryRate * 100) / 100,
-          technicalTermsProcessed: this.metrics.technicalTermsProcessed,
-          embeddingEnhancements: this.metrics.embeddingEnhancements,
-        },
-        cache: {
-          embeddingCacheSize: this.embeddingCache.size,
-          responseCacheSize: this.responseCache.size,
-          drillingCacheSize: this.drillingQueryCache.size,
-          maxCacheSize: this.MAX_CACHE_SIZE,
-          cacheTTL: `${this.CACHE_TTL_MS / 1000}s (${
-            this.DRILLING_CACHE_TTL_MS / 1000
-          }s for drilling)`,
-        },
-        system: {
-          uptime: process.uptime(),
-          memoryUsage: process.memoryUsage(),
-          nodeVersion: process.version,
-          optimizationVersion: "2.0-drilling-search",
-        },
-      };
-
-      return handlers.response.success({
-        res,
-        message: "Enhanced drilling service metrics retrieved",
-        data: metricsData,
-      });
-    } catch (error) {
-      handlers.response.error({
-        res,
-        message: "Failed to fetch enhanced metrics",
+        message: "Failed to fetch chats",
         statusCode: 500,
       });
     }
   }
 
-  /**
-   * Enhanced cache clearing with drilling-specific options
-   */
-  async clearCache(req, res) {
-    try {
-      const { type = "all" } = req.body;
-      let cleared = [];
-
-      if (type === "embedding" || type === "all") {
-        this.embeddingCache.clear();
-        cleared.push("embeddings");
-      }
-
-      if (type === "response" || type === "all") {
-        this.responseCache.clear();
-        cleared.push("responses");
-      }
-
-      if (type === "drilling" || type === "all") {
-        this.drillingQueryCache.clear();
-        cleared.push("drilling analyses");
-      }
-
-      console.log(`🧹 Cache cleared: ${cleared.join(", ")}`);
-
-      return handlers.response.success({
-        res,
-        message: `Successfully cleared ${cleared.join(", ")} cache`,
-        data: {
-          clearedCaches: cleared,
-          timestamp: new Date().toISOString(),
-          serviceType: "drilling-optimized",
-        },
-      });
-    } catch (error) {
-      handlers.response.error({
-        res,
-        message: "Failed to clear enhanced cache",
-        statusCode: 500,
-      });
-    }
-  }
-
-  // ========== UTILITY METHODS ==========
-
-  /**
-   * Normalize query key for consistent caching
-   */
-  normalizeQueryKey(query) {
-    return query.toLowerCase().trim().replace(/\s+/g, " ");
-  }
-
-  /**
-   * Classify query type for optimization
-   */
-  classifyQuery(query) {
-    const lowerQuery = query.toLowerCase();
-
-    if (this.isAggregationQuery(lowerQuery)) return "aggregation";
-    if (this.isComparisonQuery(lowerQuery)) return "comparison";
-    if (this.isDrillingQuery(lowerQuery)) return "drilling";
-
-    return "general";
-  }
-
-  /**
-   * Check if query is drilling-related
-   */
-  isDrillingQuery(query) {
-    const drillingTerms = [
-      "motor",
-      "stator",
-      "bit",
-      "bha",
-      "rop",
-      "wob",
-      "tfa",
-      "drilling",
-      "circulation",
-      "slide",
-      "rotary",
-      "footage",
-      "nmdc",
-      "ubho",
-      "float sub",
-      "shock sub",
-      "differential pressure",
-    ];
-
-    const lowerQuery = query.toLowerCase();
-    return drillingTerms.some(term => lowerQuery.includes(term));
-  }
-
-  /**
-   * Check if query requires aggregation
-   */
-  isAggregationQuery(query) {
-    const aggregationTerms = [
-      "most used",
-      "average",
-      "total",
-      "highest",
-      "lowest",
-      "common",
-      "typical",
-      "median",
-      "sum of",
-      "count of",
-    ];
-
-    return aggregationTerms.some(term => query.includes(term));
-  }
-
-  /**
-   * Check if query is comparison-based
-   */
-  isComparisonQuery(query) {
-    const comparisonTerms = [
-      "vs",
-      "versus",
-      "compare",
-      "difference",
-      "better than",
-      "worse than",
-      "higher than",
-      "lower than",
-    ];
-
-    return comparisonTerms.some(term => query.includes(term));
-  }
-
-  /**
-   * Assess query complexity
-   */
-  assessQueryComplexity(query) {
-    let complexity = 1;
-
-    if (this.isAggregationQuery(query)) complexity += 2;
-    if (this.isComparisonQuery(query)) complexity += 1;
-    if (this.countTechnicalTerms(query) > 3) complexity += 1;
-    if (query.length > 100) complexity += 1;
-
-    return Math.min(complexity, 5);
-  }
-
-  /**
-   * Count technical terms in query
-   */
-  countTechnicalTerms(query) {
-    const technicalTerms = [
-      "motor",
-      "stator",
-      "bit",
-      "bha",
-      "rop",
-      "wob",
-      "tfa",
-      "nmdc",
-      "ubho",
-      "differential pressure",
-      "circulation hours",
-      "slide footage",
-      "rotary footage",
-    ];
-
-    const lowerQuery = query.toLowerCase();
-    return technicalTerms.filter(term => lowerQuery.includes(term)).length;
-  }
-
-  /**
-   * Get search options based on query type
-   */
-  getSearchOptions(queryType, isDrilling) {
-    const baseOptions = {
-      limit: 10,
-      scoreThreshold: 0.6,
-      enableReranking: true,
-    };
-
-    if (queryType === "aggregation") {
-      return {
-        ...baseOptions,
-        limit: 25,
-        scoreThreshold: 0.5,
-        queryType: "aggregation",
-      };
-    }
-
-    if (isDrilling) {
-      return {
-        ...baseOptions,
-        limit: 15,
-        scoreThreshold: 0.7,
-        queryType: "specific",
-      };
-    }
-
-    return baseOptions;
-  }
-
-  /**
-   * Build enhanced context from search results
-   */
-  buildEnhancedContext(results, queryType, isDrilling) {
-    if (queryType === "aggregation") {
-      // For aggregation queries, prioritize structured data
-      const structuredResults = results.filter(
-        r =>
-          r.payload.content.includes("STRUCTURED DATA") ||
-          r.payload.content.includes("METRICS:")
-      );
-
-      const regularResults = results.filter(
-        r =>
-          !r.payload.content.includes("STRUCTURED DATA") &&
-          !r.payload.content.includes("METRICS:")
-      );
-
-      return [...structuredResults, ...regularResults]
-        .slice(0, 20)
-        .map(r => r.payload.content)
-        .join("\n\n");
-    }
-
-    return results.map(r => r.payload.content).join("\n\n");
-  }
-
-  /**
-   * Format sources with enhanced metadata
-   */
-  formatSources(results) {
-    return results.map((r, idx) => ({
-      FileName: r.payload?.name || `Document ${idx + 1}`,
-      ChunkIndex: idx,
-      Score: (r.score || 0).toFixed(2),
-      ContentType: r.payload?.contentType || "general",
-      HasStructuredData:
-        r.payload?.content?.includes("STRUCTURED DATA") || false,
-    }));
-  }
-
-  /**
-   * Get system prompt based on query type
-   **/
-  getSystemPrompt(queryType, isDrilling) {
-    if (isDrilling && queryType === "aggregation") {
-      return `You are an expert drilling engineer and data analyst. Use the provided drilling report data to answer questions about motor specifications, bit performance, BHA configurations, and operational metrics.
-
-For aggregation queries (most used, average, total, etc.):
-1. Analyze ALL provided data comprehensively
-2. Extract specific numerical values and technical specifications
-3. Perform accurate calculations and statistical analysis
-4. Provide specific numbers, percentages, and measurements
-5. Cite specific examples and data points from the reports
-
-Be precise with technical terminology and provide detailed, data-driven answers.`;
-    }
-
-    if (isDrilling) {
-      return `You are an expert drilling engineer. Use the provided drilling report data to answer technical questions about drilling operations, equipment specifications, and performance metrics. Be precise with technical terminology and provide specific, actionable information based on the drilling data.`;
-    }
-
-    return `You are an intelligent AI assistant. Use only the context below to answer the question. Be accurate, clear, and concise.`;
-  }
-
-  /**
-   * Build user prompt with enhanced context
-   **/
-  buildUserPrompt(context, query, queryType) {
-    if (queryType === "aggregation") {
-      return `Drilling Report Data:\n${context}\n\nAnalyze the above drilling data to answer this question: ${query}\n\nProvide specific numbers, calculations, and cite examples from the data.`;
-    }
-
-    return `Context:\n${context}\n\nQuestion: ${query}`;
-  }
-
-  /**
-   * Analyze chat history for insights
-   */
-  analyzeChatHistory(chats) {
-    const drillingChats = chats.filter(c => c.isDrillingQuery);
-    const totalTechnicalTerms = chats.reduce(
-      (sum, c) => sum + (c.technicalTermsCount || 0),
-      0
-    );
-
-    return {
-      totalChats: chats.length,
-      drillingChats: drillingChats.length,
-      drillingPercentage:
-        chats.length > 0
-          ? Math.round((drillingChats.length / chats.length) * 100)
-          : 0,
-      averageTechnicalTerms:
-        chats.length > 0
-          ? Math.round((totalTechnicalTerms / chats.length) * 10) / 10
-          : 0,
-      mostCommonQueryTypes: this.getMostCommonQueryTypes(chats),
-    };
-  }
-
-  /**
-   * Get most common query types from chat history
-   */
-  getMostCommonQueryTypes(chats) {
-    const types = {};
-    chats.forEach(chat => {
-      const type = chat.queryType || "general";
-      types[type] = (types[type] || 0) + 1;
-    });
-
-    return Object.entries(types)
-      .sort(([, a], [, b]) => b - a)
-      .slice(0, 3)
-      .map(([type, count]) => ({ type, count }));
-  }
-
-  /**
-   * Delete all chats for a user
-   */
   async deleteAllUserChats(req, res) {
     try {
       const userId = req.user?.UserId;
@@ -903,24 +250,19 @@ Be precise with technical terminology and provide detailed, data-driven answers.
         return handlers.response.failed({ res, message: "Missing userId" });
       }
 
-      // Safety check - require explicit confirmation
       if (!confirmDeletion) {
         return handlers.response.failed({
           res,
-          message:
-            "Please confirm deletion by sending { confirmDeletion: true }",
+          message: "Set confirmDeletion: true to proceed",
           statusCode: 400,
         });
       }
 
-      console.log(`🗑️ Starting deletion of all chats for user: ${userId}`);
-
       let deletedCount = 0;
-      let lastEvaluatedKey = null;
-      const batchSize = 25; // DynamoDB batch write limit
+      let lastKey = null;
 
       do {
-        // Query to get chat items for the user
+        // Get items to delete
         const queryParams = {
           TableName: this.tableName,
           IndexName: "UserIdIndex",
@@ -930,163 +272,56 @@ Be precise with technical terminology and provide detailed, data-driven answers.
             ":userId": userId,
             ":entityType": "Chat",
           },
-          ProjectionExpression: "PK, SK", // Only get keys for deletion
-          Limit: 100, // Get more items per query
+          ProjectionExpression: "PK, SK",
+          Limit: 25,
         };
 
-        if (lastEvaluatedKey) {
-          queryParams.ExclusiveStartKey = lastEvaluatedKey;
-        }
+        if (lastKey) queryParams.ExclusiveStartKey = lastKey;
 
-        console.log(`🔍 Querying for chat items...`);
         const queryResult = await docClient.send(new QueryCommand(queryParams));
-
         const items = queryResult.Items || [];
-        console.log(`📋 Found ${items.length} chat items in this batch`);
 
-        if (items.length === 0) {
-          break;
-        }
+        if (items.length === 0) break;
 
-        // Delete items in batches of 25
-        for (let i = 0; i < items.length; i += batchSize) {
-          const batch = items.slice(i, i + batchSize);
+        // Delete batch
+        const deleteRequests = items.map(item => ({
+          DeleteRequest: { Key: { PK: item.PK, SK: item.SK } },
+        }));
 
-          const deleteRequests = batch.map(item => ({
-            DeleteRequest: {
-              Key: {
-                PK: item.PK,
-                SK: item.SK,
-              },
-            },
-          }));
+        await docClient.send(
+          new BatchWriteCommand({
+            RequestItems: { [this.tableName]: deleteRequests },
+          })
+        );
 
-          const batchWriteParams = {
-            RequestItems: {
-              [this.tableName]: deleteRequests,
-            },
-          };
+        deletedCount += items.length;
+        lastKey = queryResult.LastEvaluatedKey;
 
-          console.log(`🗑️ Deleting batch of ${deleteRequests.length} items...`);
-
-          // Retry batch write with exponential backoff
-          await this.retryBatchWrite(batchWriteParams);
-          deletedCount += deleteRequests.length;
-
-          console.log(
-            `✅ Deleted ${deleteRequests.length} items. Total: ${deletedCount}`
-          );
-        }
-
-        lastEvaluatedKey = queryResult.LastEvaluatedKey;
-
-        // Small delay between batches to avoid throttling
-        if (lastEvaluatedKey) {
-          await new Promise(resolve => setTimeout(resolve, 100));
-        }
-      } while (lastEvaluatedKey);
-
-      console.log(
-        `🎉 Deletion complete! Deleted ${deletedCount} chat items for user ${userId}`
-      );
+        // Small delay to avoid throttling
+        if (lastKey) await new Promise(r => setTimeout(r, 100));
+      } while (lastKey);
 
       return handlers.response.success({
         res,
-        message: `Successfully deleted all user chats`,
-        data: {
-          userId,
-          deletedCount,
-          timestamp: new Date().toISOString(),
-        },
+        message: "All user chats deleted",
+        data: { userId, deletedCount },
       });
     } catch (error) {
-      console.error("❌ Delete chats error:", error);
+      console.error("❌ Delete error:", error);
       return handlers.response.error({
         res,
-        message: error.message || "Failed to delete user chats",
+        message: "Failed to delete chats",
         statusCode: 500,
-        data: {
-          userId: req.user?.UserId,
-          error: error.message,
-        },
       });
     }
   }
 
-  /**
-   * Retry batch write with exponential backoff for unprocessed items
-   */
-  async retryBatchWrite(batchWriteParams, maxRetries = 3) {
-    let attempt = 0;
-    let unprocessedItems = batchWriteParams;
-
-    while (
-      attempt < maxRetries &&
-      unprocessedItems.RequestItems &&
-      Object.keys(unprocessedItems.RequestItems).length > 0
-    ) {
-      try {
-        const result = await docClient.send(
-          new BatchWriteCommand(unprocessedItems)
-        );
-
-        // If there are unprocessed items, retry them
-        if (
-          result.UnprocessedItems &&
-          Object.keys(result.UnprocessedItems).length > 0
-        ) {
-          unprocessedItems = { RequestItems: result.UnprocessedItems };
-          attempt++;
-
-          // Exponential backoff delay
-          const delay = Math.min(1000 * Math.pow(2, attempt), 5000);
-          console.log(
-            `⚠️ ${
-              Object.values(result.UnprocessedItems)[0].length
-            } unprocessed items, retrying in ${delay}ms...`
-          );
-          await new Promise(resolve => setTimeout(resolve, delay));
-        } else {
-          // All items processed successfully
-          break;
-        }
-      } catch (error) {
-        attempt++;
-        if (attempt >= maxRetries) {
-          throw error;
-        }
-
-        const delay = Math.min(1000 * Math.pow(2, attempt), 5000);
-        console.log(
-          `❌ Batch write attempt ${attempt} failed, retrying in ${delay}ms...`
-        );
-        await new Promise(resolve => setTimeout(resolve, delay));
-      }
-    }
-
-    if (
-      attempt >= maxRetries &&
-      unprocessedItems.RequestItems &&
-      Object.keys(unprocessedItems.RequestItems).length > 0
-    ) {
-      throw new Error(
-        `Failed to process all items after ${maxRetries} attempts`
-      );
-    }
-  }
-
-  /**
-   * Get count of user chats (for confirmation before deletion)
-   */
   async getUserChatCount(req, res) {
     try {
       const userId = req.user?.UserId;
-
       if (!userId) {
         return handlers.response.failed({ res, message: "Missing userId" });
       }
-
-      console.log(`📊 Counting chats for user: ${userId}`);
 
       let totalCount = 0;
       let lastEvaluatedKey = null;
@@ -1101,7 +336,7 @@ Be precise with technical terminology and provide detailed, data-driven answers.
             ":userId": userId,
             ":entityType": "Chat",
           },
-          Select: "COUNT", // Only count, don't return items
+          Select: "COUNT",
           Limit: 1000,
         };
 
@@ -1113,8 +348,6 @@ Be precise with technical terminology and provide detailed, data-driven answers.
         totalCount += result.Count || 0;
         lastEvaluatedKey = result.LastEvaluatedKey;
       } while (lastEvaluatedKey);
-
-      console.log(`📈 User ${userId} has ${totalCount} chat items`);
 
       return handlers.response.success({
         res,
@@ -1136,4 +369,4 @@ Be precise with technical terminology and provide detailed, data-driven answers.
   }
 }
 
-module.exports = new EnhancedDrillingSearchService();
+module.exports = new ChatService();

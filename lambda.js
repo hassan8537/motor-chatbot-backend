@@ -3,10 +3,7 @@ const serverlessExpress = require("@codegenie/serverless-express");
 const app = require("./app"); // Your existing Express app
 
 // Configure for Lambda environment
-if (
-  process.env.AWS_LAMBDA_FUNCTION_NAME ||
-  process.env.NODE_ENV === "production"
-) {
+if (process.env.LAMBDA_FUNCTION_NAME || process.env.NODE_ENV === "production") {
   // Lambda-specific configurations
   app.set("trust proxy", true);
 
